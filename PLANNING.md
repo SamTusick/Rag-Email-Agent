@@ -193,7 +193,10 @@ to add and we want the real flow working end-to-end for step 1's stated goal
 
 ### Step 2 — Chunk + Embed
 
-**Status: proposed, awaiting approval. Nothing below is implemented yet.**
+**Status: done.** Ran end-to-end — 50 most recent emails fetched, cleaned
+(HTML stripped, quoted replies/signatures stripped), chunked (1000 chars /
+200 overlap), embedded via local Ollama (`nomic-embed-text`, 768 dims), and
+upserted into Postgres/pgvector.
 
 #### Postgres / pgvector (local Docker)
 
