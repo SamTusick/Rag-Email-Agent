@@ -1,3 +1,6 @@
+# MSAL token cache — contains a refresh token, treat as a credential
+token_cache.bin
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -156,6 +159,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.env.example
 
 # Spyder project settings
 .spyderproject
@@ -216,3 +220,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
