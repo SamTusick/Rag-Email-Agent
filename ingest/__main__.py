@@ -6,7 +6,7 @@ from ingest.cleaning import html_to_text, strip_quoted
 from ingest.db import get_connection, replace_chunks, upsert_email
 from ingest.embeddings import embed_text
 
-EXPECTED_EMBEDDING_DIM = 768
+EXPECTED_EMBEDDING_DIM = 1536
 
 
 def main():
@@ -34,20 +34,21 @@ def main():
             if len(embeddings[0]) != EXPECTED_EMBEDDING_DIM:
                 raise ValueError(
                     f"Embedding dimension {len(embeddings[0])} from "
-                    f"{config.OLLAMA_EMBEDDING_MODEL} does not match schema's "
+                    f"{config.OPENAI_EMBEDDING_MODEL} does not match schema's "
                     f"VECTOR({EXPECTED_EMBEDDING_DIM})"
                 )
 
             with conn.transaction():
                 email_id = upsert_email(
                     conn,
+                    config.ACCOUNT_ID,
                     msg["id"],
                     msg.get("subject"),
                     msg["from"]["emailAddress"]["address"],
                     msg["receivedDateTime"],
                     text,
                 )
-                replace_chunks(conn, email_id, list(zip(chunks, embeddings)))
+                replace_chunks(conn, config.ACCOUNT_ID, email_id, list(zip(chunks, embeddings)))
 
             print(f"Ingested {msg['id']}: {len(chunks)} chunks")
     finally:

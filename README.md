@@ -12,7 +12,15 @@ See [CLAUDE.md](CLAUDE.md) for the full build order and current status, and
 - Python, Flask
 - Postgres + `pgvector` for embedding storage/similarity search (local Docker container)
 - Microsoft Graph API via MSAL (personal Outlook account, `Mail.Read` + `Mail.Send` scopes)
-- Ollama (local, free) for generating embeddings — currently `nomic-embed-text`
+- OpenAI API (`text-embedding-3-small`) for generating embeddings
+
+## Status
+
+- ✅ Step 1 — OAuth + basic fetch
+- ✅ Step 2 — Chunk + embed emails into Postgres/pgvector
+- ⏳ Step 3 — Retrieval + summarization/triage (not started)
+- ⏳ Step 4 — Daily digest dispatch
+- ⏳ Step 5 — Automation + guardrails
 
 ## Setup
 
@@ -24,13 +32,11 @@ permissions) are documented in [PLANNING.md](PLANNING.md) under Step 1 —
 follow those exactly, since the auth flow depends on the registration
 matching `config.py`/`.env`.
 
-### 2. Ollama
+### 2. OpenAI API key
 
-Install [Ollama](https://ollama.com), then pull the embedding model:
-
-```bash
-ollama pull nomic-embed-text
-```
+Get an API key from [platform.openai.com](https://platform.openai.com) —
+used for generating chunk embeddings (`text-embedding-3-small`). Cost is
+negligible at this project's volume (a few thousand tokens per ingest run).
 
 ### 3. Postgres (Docker)
 
@@ -39,7 +45,10 @@ docker compose up -d
 ```
 
 This starts a `pgvector/pgvector` Postgres container and runs
-`db/init/001_schema.sql` on first boot to create the schema.
+`db/init/001_schema.sql` on first boot to create the schema. If the schema
+changes after your container already exists, apply the relevant file(s) in
+`db/migrations/` by hand (see PLANNING.md for the pattern) — `db/init/`
+only runs against a fresh, empty volume.
 
 ### 4. Python environment
 
@@ -55,10 +64,12 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill in `CLIENT_ID` (from the Azure app registration), a random
-`FLASK_SECRET_KEY`, and Postgres credentials (these initialize the Docker
-container, so pick values before first running `docker compose up`, or run
-`docker compose down -v` to reinit if you change them after). See
+Fill in `ACCOUNT_ID` (your Outlook account's email address — manually set
+for now, ahead of real multi-account OAuth support), `CLIENT_ID` (from the
+Azure app registration), a random `FLASK_SECRET_KEY`, `OPENAI_API_KEY`, and
+Postgres credentials (these initialize the Docker container, so pick values
+before first running `docker compose up`, or run `docker compose down -v`
+to reinit if you change them after — this wipes local dev data). See
 `.env.example` for the full list with comments.
 
 ## Running
@@ -79,10 +90,10 @@ python -m ingest
 ```
 
 Requires an existing `token_cache.bin` (i.e. you've logged in via the app
-at least once already) and the Postgres container + Ollama running. Fetches
-the most recent 50 messages, cleans and chunks each one, embeds the chunks
-locally via Ollama, and upserts everything into Postgres — safe to re-run
-(idempotent on Graph message ID).
+at least once already) and the Postgres container running. Fetches the most
+recent 50 messages, cleans and chunks each one, embeds the chunks via the
+OpenAI API, and upserts everything into Postgres — safe to re-run
+(idempotent on account + Graph message ID).
 
 ## Project layout
 
@@ -97,9 +108,10 @@ graph/
 ingest/
   cleaning.py            # HTML stripping, quoted-reply/signature stripping
   chunking.py            # character-based chunking
-  embeddings.py          # Ollama embedding calls
+  embeddings.py          # OpenAI embedding calls
   db.py                  # Postgres upsert/replace helpers
   __main__.py             # ingestion orchestration (python -m ingest)
 db/init/                # Postgres schema, applied on first container boot
+db/migrations/          # hand-applied schema changes for existing containers
 docker-compose.yml       # local Postgres/pgvector container
 ```

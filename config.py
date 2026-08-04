@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+ACCOUNT_ID = os.environ["ACCOUNT_ID"]
 CLIENT_ID = os.environ["CLIENT_ID"]
 AUTHORITY = os.environ["AUTHORITY"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
@@ -19,8 +20,8 @@ POSTGRES_DB = os.environ["POSTGRES_DB"]
 POSTGRES_USER = os.environ["POSTGRES_USER"]
 POSTGRES_PASSWORD = os.environ["POSTGRES_PASSWORD"]
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_EMBEDDING_MODEL = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "200"))

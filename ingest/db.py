@@ -16,34 +16,34 @@ def get_connection():
     return conn
 
 
-def upsert_email(conn, graph_message_id, subject, sender, received_at, body_text):
+def upsert_email(conn, account_id, graph_message_id, subject, sender, received_at, body_text):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO emails (graph_message_id, subject, sender, received_at, raw_body)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (graph_message_id) DO UPDATE
+            INSERT INTO emails (account_id, graph_message_id, subject, sender, received_at, raw_body)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (account_id, graph_message_id) DO UPDATE
               SET subject = EXCLUDED.subject,
                   sender = EXCLUDED.sender,
                   received_at = EXCLUDED.received_at,
                   raw_body = EXCLUDED.raw_body
             RETURNING id
             """,
-            (graph_message_id, subject, sender, received_at, body_text),
+            (account_id, graph_message_id, subject, sender, received_at, body_text),
         )
         return cur.fetchone()[0]
 
 
-def replace_chunks(conn, email_id, chunks_with_embeddings):
+def replace_chunks(conn, account_id, email_id, chunks_with_embeddings):
     with conn.cursor() as cur:
         cur.execute("DELETE FROM email_chunks WHERE email_id = %s", (email_id,))
         cur.executemany(
             """
-            INSERT INTO email_chunks (email_id, chunk_index, content, embedding)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO email_chunks (account_id, email_id, chunk_index, content, embedding)
+            VALUES (%s, %s, %s, %s, %s)
             """,
             [
-                (email_id, i, content, embedding)
+                (account_id, email_id, i, content, embedding)
                 for i, (content, embedding) in enumerate(chunks_with_embeddings)
             ],
         )
