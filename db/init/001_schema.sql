@@ -14,14 +14,14 @@ CREATE TABLE emails (
 
 CREATE INDEX emails_account_id_idx ON emails (account_id);
 
--- vector dimension must match OLLAMA_EMBEDDING_MODEL's output (nomic-embed-text = 768)
+-- vector dimension must match OPENAI_EMBEDDING_MODEL's output (text-embedding-3-small = 1536)
 CREATE TABLE email_chunks (
     id          BIGSERIAL PRIMARY KEY,
     account_id  TEXT NOT NULL,
     email_id    BIGINT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
     chunk_index INT NOT NULL,
     content     TEXT NOT NULL,
-    embedding   VECTOR(768) NOT NULL,
+    embedding   VECTOR(1536) NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (email_id, chunk_index)
 );
