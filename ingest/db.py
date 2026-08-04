@@ -12,6 +12,7 @@ def get_connection():
         user=config.POSTGRES_USER,
         password=config.POSTGRES_PASSWORD,
     )
+    conn.autocommit = True
     register_vector(conn)
     return conn
 

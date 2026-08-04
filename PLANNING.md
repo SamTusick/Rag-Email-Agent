@@ -12,9 +12,6 @@ See [CLAUDE.md](CLAUDE.md) for stack overview and build order.
   digest if the job runs twice in a day? What happens if summarization
   fails partway — does a partial digest send, or does the job abort and
   alert some other way (log file, fallback "digest failed" email)?
-- **Time window definition:** "All emails from that day" — calendar day in
-  what timezone? What happens to emails that arrive after the job runs but
-  before midnight?
 
 ## Decisions
 
@@ -27,6 +24,53 @@ Format for each entry:
 - **Alternatives considered:**
 - **Revisit if:**
 -->
+
+### 2026-08-04 — Summarization/triage LLM: OpenAI, not Anthropic
+
+- **Decision:** Use OpenAI's budget-tier chat model (e.g. GPT-5 Mini) for
+  Step 3's summarization + urgency grading, rather than adding a separate
+  Anthropic API key.
+- **Why:** Already have OpenAI billing set up for embeddings; one
+  provider/one API key is simpler than two. Cost difference between
+  providers is negligible at this volume either way — this was a
+  simplicity call, not a cost or quality call.
+- **Alternatives considered:** Anthropic API (Claude Haiku 4.5) — slightly
+  more expensive per token, would need a second provider account/key.
+  Considered legitimate but not worth the added complexity given no
+  strong reason to need Claude specifically here.
+- **Revisit if:** OpenAI's model quality proves inadequate for urgency
+  judgment specifically (this is more of a nuanced-reasoning task than
+  pure extraction) — Claude would be the first alternative to try.
+
+### 2026-08-04 — Context retrieval: group by sender, not conversation thread
+
+- **Decision:** For Step 3's "context for summary" retrieval, group past
+  emails by sender address rather than Graph's conversationId (thread ID).
+- **Why:** No schema change needed — sender is already captured. Good
+  enough for the common case (same person/service emailing repeatedly).
+- **Known limitation:** same-sender can both over-group (unrelated emails
+  from a shared address like noreply@) and under-group (a reply from a
+  different participant in the same thread won't be caught).
+- **Revisit if:** retrieval quality testing in Step 3 shows this producing
+  bad context in practice — conversationId is available from Graph and
+  would need to be added to the emails table if so.
+
+### 2026-08-04 — Digest time window: previous calendar day, midnight-to-midnight Eastern
+
+- **Decision:** "Today's emails" = all emails with `received_at` falling within
+  the previous calendar day, midnight-to-midnight in US Eastern time.
+- **Why:** Matches human intuition of "yesterday" better than a rolling
+  24-hour window, and doesn't require tracking last-run state the way a
+  since-last-successful-run approach would.
+- **Implementation note:** Eastern shifts between EST/UTC-5 and EDT/UTC-4
+  across the year — must use a proper timezone-aware library (Python's
+  `zoneinfo`, not a fixed UTC offset) so the boundary is correct year-round,
+  not just half of it.
+- **Alternatives considered:** rolling 24h from job run time (simpler, but
+  doesn't match "yesterday" intuitively); since-last-successful-run (most
+  accurate, but adds state-tracking complexity not worth it yet).
+- **Revisit if:** the group of users spans multiple timezones later — a
+  single fixed timezone stops making sense once it's not just you.
 
 ### 2026-08-03 — Scheduling: move to cloud (Lambda + EventBridge), superseding local-cron decision
 
@@ -300,7 +344,7 @@ no migration-tracking framework yet:
 - `db/init/001_schema.sql` updated to the **target** shape directly —
   `account_id TEXT NOT NULL` on both tables, `emails` unique constraint is
   `UNIQUE (account_id, graph_message_id)`, plus a plain btree index on
-  `account_id` on each table. This only affects *fresh* volumes going
+  `account_id` on each table. This only affects _fresh_ volumes going
   forward (first boot on an empty one) — doesn't touch the already-running
   container.
 - `db/migrations/migrations.sql` (new) — applied by hand against the
@@ -315,7 +359,7 @@ no migration-tracking framework yet:
   not introducing one yet since this is still a single-developer, low
   schema-churn project.
 - Idempotency key on `emails` becomes the **composite** `(account_id,
-  graph_message_id)`, not `graph_message_id` alone — needed once more than
+graph_message_id)`, not `graph_message_id` alone — needed once more than
   one mailbox can land the same-shaped IDs in the same table.
 - `email_chunks.account_id` is denormalized (redundant with
   `emails.account_id` via `email_id`) rather than requiring a join — matters
@@ -330,6 +374,7 @@ no migration-tracking framework yet:
   in `.env`) before it's run against the container.
 
 **Code changes:**
+
 - `config.py`: add `ACCOUNT_ID = os.environ["ACCOUNT_ID"]` (required — no
   sensible default when every row must be scoped). Add to `.env.example`
   with a comment explaining it's a manual stand-in until real OAuth-derived
@@ -446,6 +491,7 @@ is a trivial fraction of a cent. Not a real cost concern at this volume,
 flagging only because cost was an explicit constraint in earlier decisions.
 
 **Verification after implementing:**
+
 1. Apply the migration against the running container (same
    `docker compose exec -T db psql ...` pattern used for the account_id
    migration).
@@ -542,7 +588,266 @@ safe — matches the idempotency concerns already flagged for step 5.
 
 ### Step 3 — Retrieval + Summarization/Triage
 
-_(not started)_
+**Status: done.** Implemented and verified end-to-end — 43 emails from the
+previous-day Eastern window summarized and graded, rows confirmed durably
+persisted in `email_summaries` (39 low, 2 medium, 1 high, 1 urgent). Scope
+per the three 2026-08-04
+decisions above (time window, sender-based context grouping, OpenAI LLM
+choice). Output is populated `email_summaries` rows only — no digest
+formatting or dispatch (that's step 4).
+
+#### New package: `triage/`
+
+```
+triage/
+  __init__.py
+  time_window.py   # previous_day_window() — Eastern midnight-to-midnight, zoneinfo
+  db.py             # target-email query, sender-context query, grounding query, upsert_summary
+  llm.py             # prompt building + OpenAI chat completions call
+  __main__.py         # orchestration — run via `python -m triage`
+```
+
+Mirrors `ingest/`'s one-file-per-concern shape. `triage/db.py` reuses
+`ingest.db.get_connection` rather than duplicating connection setup.
+
+#### 1. Selecting "today's" emails
+
+```python
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+EASTERN = ZoneInfo("America/New_York")
+
+def previous_day_window(now=None):
+    now = (now or datetime.now(EASTERN)).astimezone(EASTERN)
+    end = datetime.combine(now.date(), time.min, tzinfo=EASTERN)
+    start = end - timedelta(days=1)
+    return start, end
+```
+
+Query: `WHERE account_id = %s AND received_at >= %s AND received_at < %s`.
+`received_at` is `TIMESTAMPTZ` (an absolute instant), so comparing against
+tz-aware Eastern boundaries via psycopg is correct without manual UTC
+conversion. Using `zoneinfo` (not a fixed offset) keeps the boundary correct
+across the EST/EDT transition, per the decision's implementation note.
+
+#### 2. Context for summary — same sender, strictly prior in time
+
+```sql
+SELECT subject, received_at, raw_body
+FROM emails
+WHERE account_id = %s AND sender = %s AND id != %s AND received_at < %s
+ORDER BY received_at DESC
+LIMIT %s
+```
+
+- Scoped by the *target* email's own `received_at`, not the batch window —
+  reaches back through all history, not just "yesterday." Matches "give the
+  summarization call some history," which wouldn't mean much restricted to
+  a single day.
+- New config `SENDER_CONTEXT_LIMIT` (default `5`) — same defaultable-int
+  pattern as `CHUNK_SIZE`.
+- Context emails' bodies are truncated to a snippet (proposed: first 300
+  chars, new `CONTEXT_SNIPPET_CHARS` config) rather than passed in full — a
+  chatty sender's history could otherwise blow up prompt size. The *target*
+  email itself always gets its full body — it's the thing actually being
+  summarized.
+
+#### 3. Grounding for urgency — pgvector similarity, strictly prior in time
+
+Reuses the target email's own chunk embeddings (already computed in step 2
+— no new embedding call needed) as the query vectors:
+
+```sql
+SELECT ec.email_id, MIN(ec.embedding <=> %s) AS distance
+FROM email_chunks ec
+JOIN emails e ON e.id = ec.email_id
+WHERE ec.account_id = %s AND ec.email_id != %s AND e.received_at < %s
+GROUP BY ec.email_id
+ORDER BY distance ASC
+LIMIT %s
+```
+
+Run once per chunk of the target email, merge results in Python (keep each
+candidate email's best/lowest distance across all query chunks), take the
+overall top `GROUNDING_LIMIT` (default `5`) distinct past emails. Cosine
+distance (`<=>`) — the standard choice for OpenAI embeddings.
+
+- **No new vector index (ivfflat/hnsw) yet** — still deferring, per the
+  step-2-era decision. Dataset is ~176 chunks; a sequential-scan KNN over
+  that is trivially fast. Revisit once real volume exists.
+- Same "strictly prior in time" filter as sender-context, for the same
+  reason: grounding "is this recurring or novel" against another
+  still-unprocessed email from today's own batch doesn't reflect
+  established history.
+
+#### 4. Summarization + urgency grading — OpenAI, `gpt-5-mini`
+
+**Recommend `gpt-5-mini`** — OpenAI's budget chat tier, matching the
+"Summarization/triage LLM" decision's own example. This is a structured
+extraction/classification task (summarize + classify into 4 buckets), not
+one needing frontier reasoning — a budget model is appropriate, keeps cost
+negligible at this volume, and reuses `OPENAI_API_KEY` (no new provider or
+key).
+
+Chat Completions endpoint with JSON mode
+(`response_format: {"type": "json_object"}`) — plain `requests`, matching
+the existing no-SDK style:
+
+```python
+def summarize_and_grade(target, sender_context, grounding):
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+        json={
+            "model": config.SUMMARIZATION_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": build_prompt(target, sender_context, grounding)},
+            ],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    response.raise_for_status()
+    result = json.loads(response.json()["choices"][0]["message"]["content"])
+    return result["summary"], result["urgency"]
+```
+
+System prompt instructs the model to return
+`{"summary": "...", "urgency": "low"|"medium"|"high"|"urgent"}`. No
+Python-side validation of the returned `urgency` value beyond what the DB's
+`CHECK` constraint enforces (below) — consistent with the "let it crash,
+re-run is safe" failure philosophy already agreed for step 2's embedding
+calls.
+
+#### 5. Urgency representation: `TEXT` + `CHECK` constraint, not a native `ENUM`
+
+Proposing 4 levels: `low`, `medium`, `high`, `urgent`.
+
+- **Not a numeric score** — LLMs are reliably good at sorting into a
+  handful of discrete buckets, but notoriously inconsistent at fine-grained
+  numeric self-rating (a "6 vs 7 out of 10" distinction isn't meaningfully
+  reproducible run to run). A small ordinal category is both more
+  trustworthy and more directly useful for a digest that wants to say
+  "here's what's urgent," not rank-sort by a shaky score.
+- **`TEXT` + `CHECK (urgency IN (...))` over a native Postgres `ENUM`
+  type** — both enforce validity at the DB layer, but a `CHECK` constraint
+  is trivially redefinable (`DROP CONSTRAINT` / `ADD CONSTRAINT`) if the
+  taxonomy needs tuning once step 4's digest formatting is actually built,
+  whereas Postgres `ENUM` types are awkward to modify (values can be added
+  but not removed without recreating the type). Favoring the
+  easier-to-change option since this project is still actively iterating.
+
+#### 6. `email_summaries` table
+
+```sql
+CREATE TABLE email_summaries (
+    id           BIGSERIAL PRIMARY KEY,
+    account_id   TEXT NOT NULL,
+    email_id     BIGINT NOT NULL UNIQUE REFERENCES emails(id) ON DELETE CASCADE,
+    summary      TEXT NOT NULL,
+    urgency      TEXT NOT NULL CHECK (urgency IN ('low', 'medium', 'high', 'urgent')),
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX email_summaries_account_id_idx ON email_summaries (account_id);
+```
+
+- `email_id UNIQUE` + upsert (`ON CONFLICT (email_id) DO UPDATE`) — one
+  summary per email, matching the idempotent-upsert pattern already used
+  for `emails`/`email_chunks`; re-running step 3 for the same day
+  regenerates rather than duplicating.
+- `account_id` denormalized (redundant via `email_id` → `emails.account_id`)
+  — same reasoning as `email_chunks`: direct filtering without a join once
+  step 4 needs "all of today's summaries for account X."
+- **No `model` column** — confirmed dropped, not needed.
+
+New `db/migrations/003_add_email_summaries.sql` (applied by hand against
+the running container, same pattern as the prior two migrations) — just the
+`CREATE TABLE` + index above, nothing destructive to existing tables.
+`db/init/001_schema.sql` also gets the same block added, for fresh installs.
+
+#### Config additions
+
+```python
+SUMMARIZATION_MODEL = os.environ.get("SUMMARIZATION_MODEL", "gpt-5-mini")
+SENDER_CONTEXT_LIMIT = int(os.environ.get("SENDER_CONTEXT_LIMIT", "5"))
+GROUNDING_LIMIT = int(os.environ.get("GROUNDING_LIMIT", "5"))
+CONTEXT_SNIPPET_CHARS = int(os.environ.get("CONTEXT_SNIPPET_CHARS", "300"))
+```
+
+All optional/defaultable — no new required `.env` value; `OPENAI_API_KEY`
+is reused as-is.
+
+#### `triage/__main__.py` — orchestration
+
+Same single-account-per-run shape as `ingest/__main__.py` (scoped by
+`config.ACCOUNT_ID`, no multi-account loop — that's still deferred
+OAuth/allowlist work): compute the previous-day window, fetch that window's
+emails for the account, and for each one build sender-context + grounding,
+call the LLM, upsert the summary.
+
+#### Not doing
+
+No digest formatting or dispatch (step 4). No new vector index. No
+Lambda/EventBridge/RDS. No new OpenAI API key. No retry/backoff on the LLM
+call (same failure philosophy as step 2 — crash is safe, re-run is
+idempotent).
+
+#### Open items (resolved)
+
+- `model` column: dropped, confirmed.
+- Default limits (`SENDER_CONTEXT_LIMIT=5`, `GROUNDING_LIMIT=5`,
+  `CONTEXT_SNIPPET_CHARS=300`) and the strictly-prior-in-time retrieval
+  filter: confirmed as proposed.
+
+#### Added during implementation: retry-with-backoff on the OpenAI call
+
+- **Decision:** `_call_openai()` in `triage/llm.py` retries up to 3 times
+  (2s/4s backoff) before raising, rather than failing on the first bad
+  response.
+- **Why:** Not the general failure-handling work step 3's plan explicitly
+  deferred to step 5 — this is narrower, reactive to a specific real issue
+  hit during implementation: `gpt-5-mini` returned intermittent `404
+  model_not_found` errors (~40-60% failure rate) for a while after OpenAI
+  org verification, which OpenAI's own error message describes as a
+  propagation delay across their backend. Confirmed via repeated `curl`
+  calls that success/failure was inconsistent request-to-request against
+  the identical payload, not a real permanent 404.
+- **Scope:** this is retry for one specific known-transient condition, not
+  general resilience (no retry in `ingest/embeddings.py`'s OpenAI call, no
+  handling for other failure modes). Step 5 remains the place for
+  comprehensive failure handling across the whole pipeline.
+- **Revisit if:** the underlying flakiness never fully resolves and 5
+  retries stop being enough — would bump `MAX_RETRIES` further or
+  investigate further rather than assume it's permanently fixed. (Bumped
+  from 3 to 5 during implementation after 3 still wasn't reliable enough at
+  the observed ~40% single-request failure rate.)
+
+#### Bug found during implementation: silent data loss from a transaction-commit gap
+
+- **Symptom:** `python -m triage` printed a success line for every email
+  ("Summarized N (...): subject") with no errors, but `email_summaries` was
+  completely empty afterward.
+- **Root cause:** `ingest.db.get_connection()` doesn't set autocommit, and
+  `triage/__main__.py` runs several plain `SELECT`s (`get_target_emails`,
+  `sender_context`, `get_chunk_embeddings`, `similar_past_emails`) *outside*
+  any `with conn.transaction():` block, interleaved with the
+  `with conn.transaction():` blocks wrapping the actual `upsert_summary`
+  writes. In psycopg3's default (non-autocommit) mode this left the
+  connection in an ambiguous open-transaction state, and whatever wasn't
+  explicitly committed was silently rolled back on `conn.close()`.
+  `ingest/__main__.py` never hit this because every one of its DB touches
+  is already inside a `with conn.transaction():` block — `triage` was the
+  first module to mix bare reads with transactional writes on the same
+  connection.
+- **Fix:** `conn.autocommit = True` added to the shared
+  `get_connection()` in `ingest/db.py` — psycopg3's own recommended
+  pattern (autocommit for reads, explicit `with conn.transaction():` for
+  atomic writes). Changes nothing observable for `ingest` (already fully
+  transaction-wrapped); fixes the silent data loss in `triage`.
+- **Verified:** re-ran after the fix — 43 rows durably persisted, confirmed
+  via a fresh `psql` query after process exit.
 
 ### Step 4 — Daily Digest Dispatch
 
