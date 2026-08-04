@@ -41,13 +41,14 @@ def main():
             with conn.transaction():
                 email_id = upsert_email(
                     conn,
+                    config.ACCOUNT_ID,
                     msg["id"],
                     msg.get("subject"),
                     msg["from"]["emailAddress"]["address"],
                     msg["receivedDateTime"],
                     text,
                 )
-                replace_chunks(conn, email_id, list(zip(chunks, embeddings)))
+                replace_chunks(conn, config.ACCOUNT_ID, email_id, list(zip(chunks, embeddings)))
 
             print(f"Ingested {msg['id']}: {len(chunks)} chunks")
     finally:

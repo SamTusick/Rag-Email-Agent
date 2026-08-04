@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+ACCOUNT_ID = os.environ["ACCOUNT_ID"]
 CLIENT_ID = os.environ["CLIENT_ID"]
 AUTHORITY = os.environ["AUTHORITY"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
