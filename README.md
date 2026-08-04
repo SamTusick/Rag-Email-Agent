@@ -1,8 +1,10 @@
 # Rag-Email-Agent
 
-A RAG-based email agent that connects to a personal Outlook account, indexes
-email content for retrieval, and (eventually) sends a daily digest email
-summarizing and triaging that day's messages by urgency.
+A RAG-based email agent for Outlook — indexes email content for retrieval
+and (eventually) sends a daily digest summarizing and triaging each day's
+messages by urgency. Built to support multiple Outlook accounts, gated by
+an allowlist, so I can use it across my own accounts and eventually share
+it with a small group of others.
 
 See [CLAUDE.md](CLAUDE.md) for the full build order and current status, and
 [PLANNING.md](PLANNING.md) for the design-decision log.
@@ -11,7 +13,7 @@ See [CLAUDE.md](CLAUDE.md) for the full build order and current status, and
 
 - Python, Flask
 - Postgres + `pgvector` for embedding storage/similarity search (local Docker container)
-- Microsoft Graph API via MSAL (personal Outlook account, `Mail.Read` + `Mail.Send` scopes)
+- Microsoft Graph API via MSAL (`Mail.Read` + `Mail.Send` scopes, personal Microsoft accounts)
 - OpenAI API (`text-embedding-3-small`) for generating embeddings
 
 ## Status
@@ -23,6 +25,13 @@ See [CLAUDE.md](CLAUDE.md) for the full build order and current status, and
 - ⏳ Step 5 — Automation + guardrails
 
 ## Setup
+
+The steps below are for **running your own deployment** of this project
+(what I do for local development, and what a cloud deployment would
+require). End users of a running deployment don't do any of this — they
+just authenticate via Microsoft OAuth and, if their email is on the
+allowlist, their account gets provisioned automatically. See PLANNING.md's
+multi-user decision for details.
 
 ### 1. Azure AD app registration
 
