@@ -25,3 +25,8 @@ OPENAI_EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embeddin
 
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "200"))
+
+SUMMARIZATION_MODEL = os.environ.get("SUMMARIZATION_MODEL", "gpt-5-mini")
+SENDER_CONTEXT_LIMIT = int(os.environ.get("SENDER_CONTEXT_LIMIT", "5"))
+GROUNDING_LIMIT = int(os.environ.get("GROUNDING_LIMIT", "5"))
+CONTEXT_SNIPPET_CHARS = int(os.environ.get("CONTEXT_SNIPPET_CHARS", "300"))

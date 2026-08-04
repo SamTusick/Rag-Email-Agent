@@ -28,8 +28,8 @@ Work proceeds in phases; do not jump ahead of the current phase without discussi
    messages read-only, confirm auth + basic Graph API access works end to end.
 2. **Chunk + embed emails** _(done)_ — parsing/cleaning email content,
    chunking strategy, generating embeddings, storing in Postgres/pgvector.
-3. **Retrieval + summarization/triage** — semantic search over embedded
-   emails, summarization, urgency grading.
+3. **Retrieval + summarization/triage** _(done)_ — semantic search over
+   embedded emails, summarization, urgency grading.
 4. **Daily digest dispatch** — compose a summary of the day's emails
    (grounded in retrieved context) and send it to the user's own inbox via
    `Mail.Send`. Self-send only, hardcoded recipient.
@@ -51,9 +51,9 @@ pipeline is stable — not before.
 
 ## Current Status
 
-Steps 1 and 2 are done and confirmed working end-to-end. Next up is
-**step 3: retrieval + summarization/triage** — not yet started, and not to
-be implemented until a plan is proposed in PLANNING.md and approved.
+Steps 1, 2, and 3 are done and confirmed working end-to-end. Next up is
+**step 4: daily digest dispatch** — not yet started, and not to be
+implemented until a plan is proposed in PLANNING.md and approved.
 
 ## Working Conventions
 
