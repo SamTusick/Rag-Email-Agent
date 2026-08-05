@@ -25,6 +25,82 @@ Format for each entry:
 - **Revisit if:**
 -->
 
+### 2026-08-05 — Per-account priority context for triage
+
+- **Decision:** New nullable `accounts.priority_context` column (free
+  text), injected into `triage/llm.py`'s system prompt when set. Managed
+  manually via `psql`, same pattern as `approved_users`.
+- **Why:** Different accounts have genuinely different notions of
+  "urgent" (e.g. `samtusick@outlook.com` is career-focused — jobs,
+  recruiters, LinkedIn matter — while `stusick@outlook.com` is personal).
+  Free text over a structured keyword/category list because triage
+  already uses an LLM to make a contextual judgment call, not keyword
+  matching — "this matters because it's from a recruiter" is exactly the
+  kind of semantic reasoning an LLM already does well, and a keyword list
+  would require hand-enumerating recruiter domains/keywords up front while
+  still missing novel ones.
+- **Alternatives considered:** structured keyword/sender-domain list per
+  account (rejected — rigid, needs separate matching logic, doesn't fit
+  what triage already does); a settings UI for self-service editing
+  (rejected for now — no admin/user-facing surface exists yet, manual SQL
+  matches the existing allowlist-management convention).
+- **Revisit if:** manual SQL editing becomes a real friction point once
+  there are enough accounts that hand-tuning each one's text doesn't scale.
+
+#### Proposed plan: `priority_context`
+
+**Status: done.** Implemented and verified against real data — the exact
+same real email ("Recruiter from Freddie Mac just sent you a message on
+WayUp", already summarized `low` before this feature existed) was fed
+through `summarize_and_grade` twice with identical inputs except
+`priority_context`: `None` → `low` (matches its original grading,
+confirming default behavior is unchanged), the `samtusick@outlook.com`
+career-focused text → `high`. Clean, isolated proof the customization
+actually shifts judgment, not just that it runs without erroring.
+`stusick@outlook.com` left `NULL` (unchanged generic behavior, matches
+"personal, no special customization" intent).
+
+- **Schema:** `ALTER TABLE accounts ADD COLUMN priority_context TEXT;` —
+  new `db/migrations/006_add_priority_context.sql`, plus the matching
+  column added to `accounts` in `db/init/001_schema.sql` for fresh installs.
+- **`auth/accounts.py`:** new `get_priority_context(conn, account_id)` —
+  `SELECT priority_context FROM accounts WHERE account_id = %s`, returns
+  `None` if unset. Kept separate from `get_all_account_ids` rather than
+  folding it in — `ingest`/`digest` don't need this data at all, no reason
+  to change their call shape.
+- **`triage/__main__.py`:** `triage_account` fetches
+  `priority_context = get_priority_context(conn, account_id)` **once per
+  account**, not per email — it doesn't vary within a batch, so fetching
+  it per-email would just be a wasted repeated query. Passed through to
+  `summarize_and_grade`.
+- **`triage/llm.py`:** the static `SYSTEM_PROMPT` constant becomes a base
+  template plus a small `_build_system_prompt(priority_context)` helper
+  that appends an "Additional context for this account's priorities: ..."
+  line when set, unchanged when not. `summarize_and_grade` gains a
+  `priority_context` parameter.
+- **Management:** e.g.
+  ```sql
+  UPDATE accounts SET priority_context =
+    'Career-focused account: emails about jobs, recruiters, LinkedIn '
+    'messages, and career opportunities are important/high priority. '
+    'Routine promotional emails stay low priority regardless of sender.'
+  WHERE account_id = 'samtusick@outlook.com';
+  ```
+  `stusick@outlook.com` stays `NULL` — unchanged generic behavior, matching
+  "personal, no special customization."
+
+##### Verification plan
+
+1. Compile-check.
+2. Apply the migration, confirm the column exists.
+3. Set `priority_context` for `samtusick@outlook.com` only, per the example
+   above.
+4. Re-run `python -m triage` for both accounts (idempotent — upserts by
+   `email_id`, safe to regenerate). Compare urgency grading on similar
+   career/promotional emails between the two accounts to confirm the
+   customization actually shifts judgment sensibly, not just that it runs
+   without erroring.
+
 ### 2026-08-05 — Bug found during verification: no `requests` timeouts anywhere, causing a real hang
 
 - **Symptom:** `python -m triage` across two accounts hung indefinitely —

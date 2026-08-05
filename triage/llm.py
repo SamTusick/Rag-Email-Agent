@@ -8,7 +8,7 @@ import config
 MAX_RETRIES = 5
 RETRY_BACKOFF_SECONDS = 2
 
-SYSTEM_PROMPT = (
+BASE_SYSTEM_PROMPT = (
     "You are an email triage assistant. You will be given an email to "
     "summarize, some of the sender's past emails for context, and some "
     "similar past emails to help judge whether this looks like a routine, "
@@ -16,6 +16,15 @@ SYSTEM_PROMPT = (
     "exactly two fields: \"summary\" (a 1-3 sentence summary of the email) "
     "and \"urgency\" (one of \"low\", \"medium\", \"high\", \"urgent\")."
 )
+
+
+def _build_system_prompt(priority_context):
+    if not priority_context:
+        return BASE_SYSTEM_PROMPT
+    return (
+        f"{BASE_SYSTEM_PROMPT}\n\n"
+        f"Additional context for this account's priorities: {priority_context}"
+    )
 
 
 def _snippet(text):
@@ -62,12 +71,12 @@ def _call_openai(payload):
     response.raise_for_status()
 
 
-def summarize_and_grade(target, sender_context, grounding):
+def summarize_and_grade(target, sender_context, grounding, priority_context):
     response = _call_openai(
         {
             "model": config.SUMMARIZATION_MODEL,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": _build_system_prompt(priority_context)},
                 {"role": "user", "content": build_prompt(target, sender_context, grounding)},
             ],
             "response_format": {"type": "json_object"},

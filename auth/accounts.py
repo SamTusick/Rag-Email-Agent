@@ -15,6 +15,16 @@ def get_all_account_ids(conn):
         return [row[0] for row in cur.fetchall()]
 
 
+def get_priority_context(conn, account_id):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT priority_context FROM accounts WHERE account_id = %s",
+            (account_id,),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def upsert_account(conn, account_id, refresh_token):
     with conn.cursor() as cur:
         cur.execute(

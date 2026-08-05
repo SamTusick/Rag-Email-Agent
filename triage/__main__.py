@@ -1,7 +1,7 @@
 import sys
 
 import config
-from auth.accounts import get_all_account_ids
+from auth.accounts import get_all_account_ids, get_priority_context
 from ingest.db import get_connection
 from triage.db import get_chunk_embeddings, get_target_emails, sender_context, similar_past_emails, upsert_summary
 from triage.llm import summarize_and_grade
@@ -13,6 +13,8 @@ def triage_account(conn, account_id, window_start, window_end):
     if not emails:
         print(f"No emails found for {account_id} in {window_start} .. {window_end}")
         return
+
+    priority_context = get_priority_context(conn, account_id)
 
     for email in emails:
         context = sender_context(
@@ -34,7 +36,7 @@ def triage_account(conn, account_id, window_start, window_end):
             config.GROUNDING_LIMIT,
         )
 
-        summary, urgency = summarize_and_grade(email, context, grounding)
+        summary, urgency = summarize_and_grade(email, context, grounding, priority_context)
 
         with conn.transaction():
             upsert_summary(conn, account_id, email["id"], summary, urgency)

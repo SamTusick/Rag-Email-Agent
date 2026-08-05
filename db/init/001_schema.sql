@@ -55,5 +55,6 @@ CREATE TABLE approved_users (
 CREATE TABLE accounts (
     account_id              TEXT PRIMARY KEY,
     encrypted_refresh_token TEXT NOT NULL,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    priority_context         TEXT
 );
