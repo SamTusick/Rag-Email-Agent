@@ -53,6 +53,7 @@ def _call_openai(payload):
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
             json=payload,
+            timeout=60,
         )
         if response.ok:
             return response

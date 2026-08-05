@@ -1,9 +1,10 @@
-from flask import Flask, jsonify, redirect, url_for
+from flask import Flask, jsonify, redirect, session, url_for
 
 import config
-from auth.msal_client import get_token_silent
+from auth.accounts import get_token_for_account
 from auth.routes import bp as auth_bp
 from graph.client import get_recent_messages
+from ingest.db import get_connection
 
 
 def create_app():
@@ -13,7 +14,15 @@ def create_app():
 
     @app.route("/")
     def fetch_messages():
-        token = get_token_silent(config.ACCOUNT_ID)
+        if not (account_id := session.get("account_id")):
+            return redirect(url_for("auth.login"))
+
+        conn = get_connection()
+        try:
+            token = get_token_for_account(conn, account_id)
+        finally:
+            conn.close()
+
         if not token:
             return redirect(url_for("auth.login"))
         return jsonify(get_recent_messages(token))

@@ -25,6 +25,176 @@ Format for each entry:
 - **Revisit if:**
 -->
 
+### 2026-08-05 — Bug found during verification: no `requests` timeouts anywhere, causing a real hang
+
+- **Symptom:** `python -m triage` across two accounts hung indefinitely —
+  no output, static memory footprint, process alive but making no
+  progress for 30+ minutes.
+- **Root cause:** none of the five `requests.get`/`requests.post` calls in
+  the codebase (`triage/llm.py`, `graph/client.py` ×3, `ingest/embeddings.py`)
+  set a `timeout`. A connection that never responds (no error, no data)
+  blocks `requests` forever — and since the existing retry logic in
+  `triage/llm.py`/`graph/client.py::send_mail` only runs *after* a response
+  comes back, it couldn't help a call that never returns at all. This is a
+  different failure mode than the OpenAI-verification flakiness handled
+  earlier (that one always returned an HTTP response, just sometimes a bad
+  one).
+- **Fix:** added `timeout=60` to the two OpenAI calls (LLM completions can
+  legitimately take a while) and `timeout=30` to the three Graph API calls.
+  Fixed all five call sites, not just the one that happened to hang first —
+  leaving the same latent gap in the other four would just mean the next
+  hang picks a different call site.
+- **Revisit if:** a legitimate slow request starts hitting these timeouts
+  in practice — bump the specific value, not the philosophy (a bounded
+  failure is always better than an unbounded hang).
+
+### 2026-08-04 — Wire DB-backed tokens into ingest/triage/digest, retire token_cache.bin path
+
+- **Decision:** Replace the manual `ACCOUNT_ID`/`token_cache.bin` path in
+  `ingest`, `triage`, and `digest` with the DB-backed `get_token_for_account`
+  built during the OAuth + allowlist step. Each command now iterates over
+  accounts present in the `accounts` table (i.e. real OAuth-provisioned,
+  allowlist-approved accounts) rather than acting on a single account read
+  from `.env`.
+- **Why:** The OAuth + allowlist step built and verified DB-backed token
+  storage, but nothing downstream used it yet — accounts could be approved
+  and stored with zero effect on the actual pipeline. This closes that gap
+  and is also the natural point to support multiple accounts per run
+  instead of one manual `.env` swap per run.
+- **Alternatives considered:** keep both paths indefinitely (rejected —
+  confusing to maintain two token sources, and defeats the purpose of
+  having built DB-backed storage).
+- **Revisit if:** N/A — this is a straightforward retirement of the old
+  path once the new one is proven correct.
+
+#### Proposed plan: wire ingest/triage/digest to the accounts table
+
+**Status: done.** Implemented and verified end-to-end against two real
+Microsoft accounts, including genuine multi-account processing in a single
+run and real failure isolation. Full repo-grep-verified — nothing missed
+beyond what's listed below.
+
+##### `auth/accounts.py` — new `get_all_account_ids(conn)`
+
+`SELECT account_id FROM accounts`, returns a list. Nothing like this
+exists yet.
+
+##### `ingest/__main__.py` and `triage/__main__.py` — extract per-account
+helper, loop over `get_all_account_ids`
+
+Fixes a real latent bug: triage's current `if not emails: ...; return`
+exits `main()` entirely on the first account with nothing to triage —
+extracted into a helper function, that return only exits the helper, so
+the outer loop correctly continues to the next account.
+
+**Failure isolation: one `try/except Exception` per account, wrapping the
+*entire* per-account body**, not just the token fetch narrowly. With only
+the token fetch wrapped, an uncaught crash mid-account (e.g. an embedding
+API error) would abort the whole process and silently skip every remaining
+account until the next scheduled run — the wider catch is what actually
+satisfies "don't let one account's problem kill it for everyone" once more
+than one account shares a run. Confirmed safe to keep reusing the same
+`conn` across iterations after a caught exception: `get_connection()`
+already sets `autocommit = True` and all writes are in their own explicit
+`with conn.transaction():` blocks, so nothing needs an extra
+`conn.rollback()`.
+
+**Triage does not call `get_token_for_account` at all** — it never calls
+Graph (pure Postgres + OpenAI). An earlier draft had it fetch-and-discard a
+token purely as an "is this account's grant still valid" liveness check,
+but that adds a real network dependency on Microsoft's identity platform
+for a step that structurally doesn't need it. The same goal is already
+achieved for free: once `ingest` correctly gates on a valid token, a
+revoked account simply stops getting new email rows, so triage naturally
+finds nothing new without an extra network call.
+
+##### `digest/__main__.py` — switch account source, reorder checks
+
+Switch from `digest.db.get_account_ids_with_summaries` (a `DISTINCT`
+query against `email_summaries`/`emails` filtered by the time window) to
+`get_all_account_ids`, for consistency with the other two. This changes
+behavior — today an account with zero summaries just never appears in the
+loop; with `get_all_account_ids` it would, so add an explicit
+`if not grouped: ...; continue`. Reorder so the two free checks
+(already-sent, has-summaries) happen *before* the token fetch — no point
+authenticating for an account with nothing to send. `get_account_ids_with_summaries`
+becomes dead code (confirmed via grep: no other callers) — delete it.
+
+##### Full retirement, not just disuse, of `token_cache.bin`/`get_token_silent`
+
+Auditing every remaining caller confirms nothing needs file-based MSAL
+caching after the above lands: `/auth/login` and `/auth/callback` each
+build a fresh `PublicClientApplication` per request, and
+`get_token_for_account` already passes its own decrypted refresh token
+explicitly. Leaving the file-cache code around unused would be dead code,
+contradicting this project's own convention (e.g. `OLLAMA_*` config was
+fully removed, not left unused, when embeddings switched providers). So:
+
+- `auth/msal_client.py` shrinks to just `build_msal_app()` returning a bare
+  `PublicClientApplication` (no cache tuple) — delete `_load_cache`,
+  `_save_cache`, `get_token_silent`.
+- `auth/routes.py`: both call sites of `build_msal_app()` update to match
+  (`app = build_msal_app()`, not `app, cache = ...`). `callback()` drops
+  its now-redundant `_save_cache(cache)` call — the DB already durably
+  stores the refresh token, and Lambda can't rely on the file anyway — and
+  gains `session["account_id"] = email` right before the final redirect
+  (this is what lets `app.py` know who just logged in, below).
+- `config.py`, `.env.example`, `.env`: remove `ACCOUNT_ID` and
+  `TOKEN_CACHE_PATH`. `.gitignore`: remove the `token_cache.bin` line.
+- The physical leftover `token_cache.bin` file becomes a genuinely unused
+  orphan — flagging as optional cleanup, not deleting it silently.
+
+##### `app.py` — necessary side-fix, not in the originally-named file list
+
+Removing `config.ACCOUNT_ID` breaks `app.py`'s `/` route otherwise (it
+currently calls `get_token_silent(config.ACCOUNT_ID)`, and has zero DB
+access today). Fixed by reading the session value `auth/routes.py` now
+sets: `if not (account_id := session.get("account_id")): return
+redirect(...)`, then `get_token_for_account(conn, account_id)` via a
+short-lived connection, same pattern as the batch scripts.
+
+##### `README.md`
+
+Update setup/running sections describing `ACCOUNT_ID`/`token_cache.bin` —
+same "don't leave stale docs" reasoning as above. Describe the new
+behavior: each command processes every account in `accounts` in one run.
+
+##### Not doing
+
+No Lambda/EventBridge/cloud deployment. No new schema/migration (`accounts`/
+`approved_users` already exist). No general resilience work beyond the
+per-account isolation described above.
+
+##### Verification — done
+
+1. Compile-check: clean.
+2. Single-account baseline confirmed for all three commands (`stusick@outlook.com`).
+3. **Genuine multi-account proof**: approved and logged in
+   `samtusick@outlook.com` for real (turned out its historical
+   `emails`/`email_summaries` rows from an earlier session weren't a typo
+   after all — they're this account's real data, now usable). All three
+   commands processed both accounts in a single run (`ingest`: 100 messages
+   across both; `triage`: 65 summaries across both; `digest`: real sends to
+   both for 2026-08-04).
+4. **Failure isolation proof**: corrupted `samtusick@outlook.com`'s stored
+   token via `psql`, ran `ingest` — `stusick@outlook.com` fully succeeded
+   (50 messages) while the other logged a clean failure and didn't block
+   anything. Restored via fresh login, re-verified both healthy.
+5. `app.py`'s `/` route confirmed working for both accounts via real
+   browser logins (session-based, no crash — confirms the `build_msal_app()`
+   signature change didn't break anything).
+6. Final repo-wide grep for `ACCOUNT_ID`, `token_cache.bin`,
+   `TOKEN_CACHE_PATH`, `get_token_silent` — zero code hits.
+
+**Bug found and fixed along the way (see the 2026-08-05 entry above this
+one):** none of the five `requests` calls in the codebase had a `timeout`,
+which caused a real 30+ minute hang during the multi-account `triage`
+verification run. Fixed all five, not just the one that hung. Also
+improved the per-account failure logging (`type(exc).__name__: {exc}`) —
+the original just printed `{exc}` alone, which was blank for
+`cryptography.fernet.InvalidToken` (no message by default) and would have
+been undiagnosable in the exact scenario this isolation logic exists for.
+
 ### 2026-08-04 — Multi-user OAuth + allowlist: encrypted token storage, manual allowlist management
 
 - **Decision:** New `accounts` table in Postgres stores each user's OAuth
@@ -63,7 +233,7 @@ EventBridge, or actual cloud deployment — that stays the next step after
 this one. **Not** wiring `ingest`/`triage`/`digest` over to the new
 per-account path yet — they keep using the existing local
 `token_cache.bin` for now; this session only builds the new capability
-they'll *eventually* call instead.
+they'll _eventually_ call instead.
 
 **Verified against the installed `msal` (1.37.0) source before committing
 to this design**, rather than assuming: MSAL has a genuinely **public,
@@ -96,7 +266,7 @@ CREATE TABLE accounts (
   one row per account, natural key, matches how `account_id` is already
   used as a plain string throughout the rest of the schema.
 - **Flagging, not deciding silently:** no `updated_at` on `accounts`, per
-  your column list — but the refresh token *will* get rewritten over time
+  your column list — but the refresh token _will_ get rewritten over time
   (rotation, see below), so there's no column tracking when that last
   happened. Cheap to add if you want it; leaving out since you specified
   the columns explicitly.
@@ -246,7 +416,7 @@ No Lambda/EventBridge/cloud deployment. No admin UI/script for
 3. `python app.py` → `/auth/login` → complete real Microsoft login →
    confirm redirect succeeds, then `SELECT * FROM accounts;` shows a row
    with an opaque (non-plaintext) `encrypted_refresh_token`.
-4. Rejection path: attempt login with an email *not* in `approved_users` →
+4. Rejection path: attempt login with an email _not_ in `approved_users` →
    confirm a clean 403 and confirm **no** row was written to `accounts`.
 5. Exercise `get_token_for_account` directly (e.g. a throwaway REPL call)
    and use the returned access token against `graph.client.get_recent_messages`

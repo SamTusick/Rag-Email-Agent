@@ -1,17 +1,3 @@
-def get_account_ids_with_summaries(conn, window_start, window_end):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT es.account_id
-            FROM email_summaries es
-            JOIN emails e ON e.id = es.email_id
-            WHERE e.received_at >= %s AND e.received_at < %s
-            """,
-            (window_start, window_end),
-        )
-        return [row[0] for row in cur.fetchall()]
-
-
 def get_summaries_for_digest(conn, account_id, window_start, window_end):
     with conn.cursor() as cur:
         cur.execute(

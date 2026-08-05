@@ -2,7 +2,7 @@ from flask import Blueprint, redirect, request, session, url_for
 
 import config
 from auth.accounts import is_approved, upsert_account
-from auth.msal_client import _save_cache, build_msal_app
+from auth.msal_client import build_msal_app
 from ingest.db import get_connection
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -10,7 +10,7 @@ bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 @bp.route("/login")
 def login():
-    app, _cache = build_msal_app()
+    app = build_msal_app()
     flow = app.initiate_auth_code_flow(
         config.GRAPH_SCOPES,
         redirect_uri=config.REDIRECT_URI,
@@ -24,7 +24,7 @@ def login():
 
 @bp.route("/callback")
 def callback():
-    app, cache = build_msal_app()
+    app = build_msal_app()
     flow = session.pop("auth_flow", {})
     result = app.acquire_token_by_auth_code_flow(flow, request.args)
 
@@ -38,10 +38,10 @@ def callback():
         if not is_approved(conn, email):
             return "Womp Womp looks like this account is not approved to use this application. Better luck next time :(", 403
 
-        _save_cache(cache)
         if "refresh_token" in result:
             upsert_account(conn, email, result["refresh_token"])
     finally:
         conn.close()
 
+    session["account_id"] = email
     return redirect(url_for("fetch_messages"))

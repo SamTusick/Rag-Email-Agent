@@ -9,6 +9,12 @@ def is_approved(conn, email):
         return cur.fetchone() is not None
 
 
+def get_all_account_ids(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT account_id FROM accounts")
+        return [row[0] for row in cur.fetchall()]
+
+
 def upsert_account(conn, account_id, refresh_token):
     with conn.cursor() as cur:
         cur.execute(
@@ -36,7 +42,7 @@ def get_token_for_account(conn, account_id):
     if not row:
         return None
 
-    app, _cache = build_msal_app()
+    app = build_msal_app()
     result = app.acquire_token_by_refresh_token(decrypt(row[0]), config.GRAPH_SCOPES)
 
     if not result or "access_token" not in result:
