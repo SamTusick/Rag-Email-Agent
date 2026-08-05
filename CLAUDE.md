@@ -30,9 +30,9 @@ Work proceeds in phases; do not jump ahead of the current phase without discussi
    chunking strategy, generating embeddings, storing in Postgres/pgvector.
 3. **Retrieval + summarization/triage** _(done)_ — semantic search over
    embedded emails, summarization, urgency grading.
-4. **Daily digest dispatch** — compose a summary of the day's emails
-   (grounded in retrieved context) and send it to the user's own inbox via
-   `Mail.Send`. Self-send only, hardcoded recipient.
+4. **Daily digest dispatch** _(done)_ — compose a summary of the day's
+   emails (grounded in retrieved context) and send it to the user's own
+   inbox via `Mail.Send`. Self-send only, hardcoded recipient.
 5. **Automation + guardrails** — run the full pipeline on a daily schedule;
    add idempotency (no duplicate digest per day) and failure handling before
    this goes live unattended.
@@ -51,9 +51,10 @@ pipeline is stable — not before.
 
 ## Current Status
 
-Steps 1, 2, and 3 are done and confirmed working end-to-end. Next up is
-**step 4: daily digest dispatch** — not yet started, and not to be
-implemented until a plan is proposed in PLANNING.md and approved.
+Steps 1 through 4 are done and confirmed working end-to-end — a real
+digest email has been sent via Graph. Next up is **step 5: automation +
+guardrails** — not yet started, and not to be implemented until a plan is
+proposed in PLANNING.md and approved.
 
 ## Working Conventions
 
