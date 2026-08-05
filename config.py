@@ -30,3 +30,7 @@ SUMMARIZATION_MODEL = os.environ.get("SUMMARIZATION_MODEL", "gpt-5-mini")
 SENDER_CONTEXT_LIMIT = int(os.environ.get("SENDER_CONTEXT_LIMIT", "5"))
 GROUNDING_LIMIT = int(os.environ.get("GROUNDING_LIMIT", "5"))
 CONTEXT_SNIPPET_CHARS = int(os.environ.get("CONTEXT_SNIPPET_CHARS", "300"))
+
+# TEMPORARY: lives in .env for now — must move to AWS Secrets Manager
+# before/at actual Lambda deployment, not after.
+TOKEN_ENCRYPTION_KEY = os.environ["TOKEN_ENCRYPTION_KEY"]

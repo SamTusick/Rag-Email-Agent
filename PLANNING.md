@@ -25,6 +25,234 @@ Format for each entry:
 - **Revisit if:**
 -->
 
+### 2026-08-04 — Multi-user OAuth + allowlist: encrypted token storage, manual allowlist management
+
+- **Decision:** New `accounts` table in Postgres stores each user's OAuth
+  refresh token, encrypted at rest (Fernet/`cryptography` package).
+  `approved_users` table gates the OAuth callback — checked before any
+  token is stored or account provisioned. Allowlist managed manually via
+  direct `psql` INSERT (no admin UI/script). Built Lambda-portable from
+  the start: no local file-based token storage, redirect URI read from
+  config not hardcoded.
+- **Why:** Local token_cache.bin doesn't survive Lambda's ephemeral
+  filesystem, so DB storage is required regardless, not just a nice-to-
+  have. Encryption is non-negotiable for other people's credentials.
+  Manual allowlist management is fine at this scale (a handful of users,
+  managed by me).
+- **Known gap:** encryption key itself lives in .env for now — should
+  move to AWS Secrets Manager when actually deployed to Lambda, not
+  before. Flagged so this isn't mistaken for the final state.
+- **Alternatives considered:** local per-account token files (rejected —
+  incompatible with Lambda's ephemeral storage); admin script for
+  allowlist management (rejected for now — unnecessary polish at this
+  scale, manual SQL is fine).
+- **Revisit if:** the encryption-key-in-.env gap hasn't been addressed by
+  the time Lambda deployment actually happens — don't let this slip.
+
+#### Proposed plan: OAuth + allowlist + encrypted token storage
+
+**Status: done.** Implemented and verified end-to-end against real Microsoft
+accounts — approved login stores an encrypted refresh token in `accounts`;
+`get_token_for_account` redeems it for a working Graph access token
+(confirmed by listing real messages) with zero dependency on
+`token_cache.bin`; and a second, non-approved real account got a clean 403
+with confirmed zero rows written anywhere. Scope: OAuth callback gating,
+`accounts`/`approved_users` tables, and a new per-account token-acquisition
+path. Tested locally against real accounts. **Not** touching Lambda,
+EventBridge, or actual cloud deployment — that stays the next step after
+this one. **Not** wiring `ingest`/`triage`/`digest` over to the new
+per-account path yet — they keep using the existing local
+`token_cache.bin` for now; this session only builds the new capability
+they'll *eventually* call instead.
+
+**Verified against the installed `msal` (1.37.0) source before committing
+to this design**, rather than assuming: MSAL has a genuinely **public,
+documented** method for exactly this scenario —
+`acquire_token_by_refresh_token(refresh_token, scopes)` — its own docstring
+describes it as being for when "you have old RTs from elsewhere... want to
+migrate them into MSAL." Also confirmed `acquire_token_by_auth_code_flow`'s
+result dict does carry a raw `refresh_token` key through to the caller
+(traced MSAL's internal `_clean_up()` — it only strips `refresh_in` and
+underscore-prefixed internal keys, everything else including
+`refresh_token` passes through). So this plan needs no private/underscore
+APIs and no guessing about response shape.
+
+##### Schema
+
+```sql
+CREATE TABLE approved_users (
+    email      TEXT PRIMARY KEY,
+    added_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE accounts (
+    account_id              TEXT PRIMARY KEY,
+    encrypted_refresh_token TEXT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+- `account_id`/`email` as the primary key directly (no surrogate `id`) —
+  one row per account, natural key, matches how `account_id` is already
+  used as a plain string throughout the rest of the schema.
+- **Flagging, not deciding silently:** no `updated_at` on `accounts`, per
+  your column list — but the refresh token *will* get rewritten over time
+  (rotation, see below), so there's no column tracking when that last
+  happened. Cheap to add if you want it; leaving out since you specified
+  the columns explicitly.
+- `approved_users` rows added by hand via `psql` — no code needed, per your
+  scope.
+- New `db/migrations/005_add_accounts_and_approved_users.sql` (applied by
+  hand against the running container, same pattern as the prior four
+  migrations); `db/init/001_schema.sql` gets the same tables added for
+  fresh installs.
+
+##### Encryption: `auth/crypto.py`
+
+```python
+from cryptography.fernet import Fernet
+
+import config
+
+def encrypt(plaintext):
+    return Fernet(config.TOKEN_ENCRYPTION_KEY).encrypt(plaintext.encode()).decode()
+
+def decrypt(ciphertext):
+    return Fernet(config.TOKEN_ENCRYPTION_KEY).decrypt(ciphertext.encode()).decode()
+```
+
+New config: `TOKEN_ENCRYPTION_KEY = os.environ["TOKEN_ENCRYPTION_KEY"]`
+(required, no default — a credential like `FLASK_SECRET_KEY`). Generate
+with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+New dependency: `cryptography`.
+
+**🚩 Flagged exactly as asked — don't let this slip:** the key itself lives
+in `.env` for now. This is temporary and must move to AWS Secrets Manager
+before/at actual Lambda deployment, not after. Recorded here and in the
+decision above so it isn't forgotten; the "next step after this" (actual
+cloud deployment) should treat this as a blocking prerequisite, not an
+afterthought.
+
+##### Account storage + token acquisition: `auth/accounts.py`
+
+```python
+import config
+from auth.crypto import decrypt, encrypt
+from auth.msal_client import build_msal_app
+
+def is_approved(conn, email):
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM approved_users WHERE email = %s", (email,))
+        return cur.fetchone() is not None
+
+def upsert_account(conn, account_id, refresh_token):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO accounts (account_id, encrypted_refresh_token)
+            VALUES (%s, %s)
+            ON CONFLICT (account_id) DO UPDATE
+              SET encrypted_refresh_token = EXCLUDED.encrypted_refresh_token
+            """,
+            (account_id, encrypt(refresh_token)),
+        )
+
+def get_token_for_account(conn, account_id):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT encrypted_refresh_token FROM accounts WHERE account_id = %s",
+            (account_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+
+    app, _cache = build_msal_app()
+    result = app.acquire_token_by_refresh_token(decrypt(row[0]), config.GRAPH_SCOPES)
+    if not result or "access_token" not in result:
+        return None
+
+    if "refresh_token" in result:  # rotation — re-store the new one
+        upsert_account(conn, account_id, result["refresh_token"])
+
+    return result["access_token"]
+```
+
+- Refresh tokens rotate on Microsoft's identity platform — every
+  successful redemption re-encrypts and re-stores whatever new
+  `refresh_token` comes back, so the stored value never goes stale from
+  our own inaction.
+- This is the function `ingest`/`triage`/`digest` will eventually call
+  instead of `auth.msal_client.get_token_silent()` — not wired in this
+  session, per scope.
+
+##### OAuth callback: `auth/routes.py`
+
+```python
+@bp.route("/callback")
+def callback():
+    app, cache = build_msal_app()
+    flow = session.pop("auth_flow", {})
+    result = app.acquire_token_by_auth_code_flow(flow, request.args)
+
+    if "access_token" not in result:
+        return f"Auth failed: {result.get('error_description', result)}", 400
+
+    email = result["id_token_claims"]["preferred_username"]
+
+    conn = get_connection()
+    try:
+        if not is_approved(conn, email):
+            return "This account is not approved to use this application.", 403
+
+        _save_cache(cache)  # existing local-cache path, unchanged
+        if "refresh_token" in result:
+            upsert_account(conn, email, result["refresh_token"])
+    finally:
+        conn.close()
+
+    return redirect(url_for("fetch_messages"))
+```
+
+- **Approval check happens before any write** — `_save_cache` and
+  `upsert_account` both sit after the `is_approved` gate, so a rejected
+  login leaves zero trace in either the local cache or the `accounts`
+  table. That's the literal mechanism satisfying "no partial provisioning."
+- `email` comes from the ID token's `preferred_username` claim, already
+  present in the auth-code-flow result (MSAL requests `openid profile` by
+  default) — no new Graph scope, same reasoning already used back when
+  this was first considered for `account_id` in step 2.
+- Reuses `ingest.db.get_connection` (already `autocommit=True`), closed
+  explicitly at the end of the request — a Flask request handler is a
+  different lifetime than the batch scripts' one-connection-per-run
+  pattern, so this doesn't reuse a long-lived connection across requests.
+
+##### Redirect URI
+
+Already satisfied — `auth/routes.py`'s `login()` already reads
+`redirect_uri=config.REDIRECT_URI` from config, not hardcoded. No change
+needed; noting it explicitly since you flagged it as a requirement.
+
+##### Not doing
+
+No Lambda/EventBridge/cloud deployment. No admin UI/script for
+`approved_users` (manual `psql`, per your scope). No wiring of
+`get_token_for_account` into `ingest`/`triage`/`digest` yet.
+
+##### Verification plan
+
+1. Apply the migration; confirm both tables exist via `psql`.
+2. Manually `INSERT` your test account's email into `approved_users`.
+3. `python app.py` → `/auth/login` → complete real Microsoft login →
+   confirm redirect succeeds, then `SELECT * FROM accounts;` shows a row
+   with an opaque (non-plaintext) `encrypted_refresh_token`.
+4. Rejection path: attempt login with an email *not* in `approved_users` →
+   confirm a clean 403 and confirm **no** row was written to `accounts`.
+5. Exercise `get_token_for_account` directly (e.g. a throwaway REPL call)
+   and use the returned access token against `graph.client.get_recent_messages`
+   to prove the encrypted-refresh-token path independently produces a
+   working Graph access token, without touching `token_cache.bin` at all.
+
 ### 2026-08-04 — Digest dispatch: separate command, templated list, tracked send-state
 
 - **Decision:** `python -m digest` as its own command, separate from
@@ -919,7 +1147,7 @@ later.
 **Fixed during planning, ahead of building digest:** `get_token_silent()`
 used to always grab `accounts[0]` from the MSAL cache regardless of which
 account was actually wanted — harmless with one account, but would have
-sent one account's digest through a *different* account's authenticated
+sent one account's digest through a _different_ account's authenticated
 mailbox once a second account's data existed, breaking the self-send trust
 boundary. Fixed by matching on username instead:
 
@@ -1002,11 +1230,11 @@ CREATE TABLE digest_log (
 ```
 
 - **No "pending/attempted" row inserted before sending** — a row only ever
-  gets inserted *after* a confirmed successful Graph send. This directly
+  gets inserted _after_ a confirmed successful Graph send. This directly
   satisfies "only mark sent on confirmed successful send" without needing
   a separate status column: existence of the row means sent, full stop.
 - Pre-send check (`SELECT 1 FROM digest_log WHERE account_id = %s AND
-  digest_date = %s`) gates the whole per-account block — if a digest was
+digest_date = %s`) gates the whole per-account block — if a digest was
   already sent for that account/date, skip entirely (no re-fetch, no
   re-send). This is what makes retrying the whole `python -m digest`
   command safe: already-sent accounts are skipped, not-yet-sent accounts

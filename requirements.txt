@@ -6,3 +6,4 @@ psycopg[binary]
 pgvector
 beautifulsoup4
 email-reply-parser
+cryptography
