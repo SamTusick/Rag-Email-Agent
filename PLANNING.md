@@ -25,6 +25,25 @@ Format for each entry:
 - **Revisit if:**
 -->
 
+### 2026-08-04 — Digest dispatch: separate command, templated list, tracked send-state
+
+- **Decision:** `python -m digest` as its own command, separate from
+  triage. Digest body is a templated list grouped/sorted by urgency
+  (urgent/high first), not an LLM-composed narrative. A new `digest_log`
+  table (account_id, digest_date, sent_at) tracks whether today's digest
+  was already sent, checked before dispatch to make retries safe.
+- **Why:** Separate command means a failed send can be retried without
+  re-running triage (summaries are already durably stored — cheap to
+  retry the send alone). Templated list avoids an extra LLM call for a
+  step that's fundamentally formatting, keeping output deterministic and
+  easy to verify. digest_log prevents a retry from double-sending.
+- **Alternatives considered:** LLM-composed narrative digest (more
+  polished, but non-deterministic and an unnecessary cost/failure point);
+  folding dispatch into the same run as triage (simpler process count,
+  but complicates retry semantics).
+- **Revisit if:** a narrative digest is wanted later — can layer on top
+  of the templated version without changing dispatch/retry logic.
+
 ### 2026-08-04 — Summarization/triage LLM: OpenAI, not Anthropic
 
 - **Decision:** Use OpenAI's budget-tier chat model (e.g. GPT-5 Mini) for
@@ -641,7 +660,7 @@ ORDER BY received_at DESC
 LIMIT %s
 ```
 
-- Scoped by the *target* email's own `received_at`, not the batch window —
+- Scoped by the _target_ email's own `received_at`, not the batch window —
   reaches back through all history, not just "yesterday." Matches "give the
   summarization call some history," which wouldn't mean much restricted to
   a single day.
@@ -649,7 +668,7 @@ LIMIT %s
   pattern as `CHUNK_SIZE`.
 - Context emails' bodies are truncated to a snippet (proposed: first 300
   chars, new `CONTEXT_SNIPPET_CHARS` config) rather than passed in full — a
-  chatty sender's history could otherwise blow up prompt size. The *target*
+  chatty sender's history could otherwise blow up prompt size. The _target_
   email itself always gets its full body — it's the thing actually being
   summarized.
 
@@ -809,7 +828,7 @@ idempotent).
 - **Why:** Not the general failure-handling work step 3's plan explicitly
   deferred to step 5 — this is narrower, reactive to a specific real issue
   hit during implementation: `gpt-5-mini` returned intermittent `404
-  model_not_found` errors (~40-60% failure rate) for a while after OpenAI
+model_not_found` errors (~40-60% failure rate) for a while after OpenAI
   org verification, which OpenAI's own error message describes as a
   propagation delay across their backend. Confirmed via repeated `curl`
   calls that success/failure was inconsistent request-to-request against
@@ -831,7 +850,7 @@ idempotent).
   completely empty afterward.
 - **Root cause:** `ingest.db.get_connection()` doesn't set autocommit, and
   `triage/__main__.py` runs several plain `SELECT`s (`get_target_emails`,
-  `sender_context`, `get_chunk_embeddings`, `similar_past_emails`) *outside*
+  `sender_context`, `get_chunk_embeddings`, `similar_past_emails`) _outside_
   any `with conn.transaction():` block, interleaved with the
   `with conn.transaction():` blocks wrapping the actual `upsert_summary`
   writes. In psycopg3's default (non-autocommit) mode this left the
@@ -851,7 +870,190 @@ idempotent).
 
 ### Step 4 — Daily Digest Dispatch
 
-_(not started — see Open Questions above, must be resolved before implementation)_
+**Status: proposed, awaiting approval.** Scope per the 2026-08-04 "Digest
+dispatch" decision above. Manual-run only — no Lambda/EventBridge (step 5).
+
+#### New package: `digest/`
+
+```
+digest/
+  __init__.py
+  db.py           # get_account_ids_with_summaries, get_summaries_for_digest, already_sent, mark_sent
+  formatting.py    # build_digest_html
+  __main__.py       # orchestration — run via `python -m digest`
+```
+
+Plus one new function in the existing `graph/client.py`: `send_mail`. Reuses
+`ingest.db.get_connection` and `triage.time_window.previous_day_window`
+(same Eastern window triage used, so digest and triage always agree on
+which emails count as "today's").
+
+#### Which accounts get a digest
+
+```sql
+SELECT DISTINCT es.account_id
+FROM email_summaries es
+JOIN emails e ON e.id = es.email_id
+WHERE e.received_at >= %s AND e.received_at < %s
+```
+
+Loops over whatever distinct `account_id`s actually have summary rows in
+the window, rather than hardcoding `config.ACCOUNT_ID` — matches "for each
+account_id" and sets the shape up correctly for real multi-account support
+later.
+
+**Known gap, flagging rather than hiding it:** `auth.msal_client.get_token_silent()`
+doesn't take an account parameter — it returns whatever's in the single
+shared `token_cache.bin`, regardless of which `account_id` this loop is
+currently on. That's harmless *today* because only one account's data
+exists in the DB. It would send the wrong account's digest to the wrong
+inbox once a second account's data exists, without also building
+per-account token storage — that's the same deferred multi-account OAuth
+work flagged back in step 2's `account_id` migration, not something to
+solve here.
+
+#### Digest body: simple HTML, not plain text
+
+**Recommend HTML** over plain text — built with plain string
+formatting/f-strings, no templating engine (matches "no unnecessary
+abstraction"):
+
+- **Plain text** would be simpler (zero escaping, renders identically
+  everywhere) but the actual product goal (CLAUDE.md: "sends the user a
+  daily digest email") wants real visual grouping by urgency, which plain
+  text can only fake with indentation/labels.
+- **HTML**'s real cost is that every interpolated value (subject, sender,
+  summary — all arbitrary email/LLM content) must be escaped to avoid
+  broken markup. That's a non-issue in practice: stdlib `html.escape()` on
+  each value, no new dependency. Given the escaping cost is trivial and the
+  payoff (actual headers/lists per urgency section, which Graph/Outlook
+  renders natively) is real, HTML wins here.
+
+```python
+URGENCY_ORDER = ["urgent", "high", "medium", "low"]
+URGENCY_LABELS = {"urgent": "Urgent", "high": "High", "medium": "Medium", "low": "Low"}
+
+def build_digest_html(digest_date, summaries_by_urgency):
+    sections = []
+    for level in URGENCY_ORDER:
+        items = summaries_by_urgency.get(level, [])
+        if not items:
+            continue
+        rows = "".join(
+            f"<li><strong>{html.escape(item['subject'] or '(no subject)')}</strong> "
+            f"— {html.escape(item['summary'])} "
+            f"<span style=\"color:#666\">({html.escape(item['sender'] or '')})</span></li>"
+            for item in items
+        )
+        sections.append(f"<h3>{URGENCY_LABELS[level]}</h3><ul>{rows}</ul>")
+    return f"<h2>Daily Digest — {digest_date.isoformat()}</h2>" + "".join(sections)
+```
+
+Sections ordered urgent → high → medium → low; empty sections omitted
+entirely rather than printed as "none." Within a section, emails are
+ordered by `received_at` (chronological), matching triage's own ordering.
+
+#### `digest_log` table — tracks confirmed sends only
+
+```sql
+CREATE TABLE digest_log (
+    id           BIGSERIAL PRIMARY KEY,
+    account_id   TEXT NOT NULL,
+    digest_date  DATE NOT NULL,
+    sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (account_id, digest_date)
+);
+```
+
+- **No "pending/attempted" row inserted before sending** — a row only ever
+  gets inserted *after* a confirmed successful Graph send. This directly
+  satisfies "only mark sent on confirmed successful send" without needing
+  a separate status column: existence of the row means sent, full stop.
+- Pre-send check (`SELECT 1 FROM digest_log WHERE account_id = %s AND
+  digest_date = %s`) gates the whole per-account block — if a digest was
+  already sent for that account/date, skip entirely (no re-fetch, no
+  re-send). This is what makes retrying the whole `python -m digest`
+  command safe: already-sent accounts are skipped, not-yet-sent accounts
+  are attempted again.
+- `UNIQUE (account_id, digest_date)` is a defensive backstop against a
+  genuine double-insert (e.g. concurrent runs) — not expected to ever fire
+  in this step's manual-run-only scope, but cheap to have and consistent
+  with letting a real conflict raise loudly rather than silently swallowing
+  it.
+- `digest_date` is `DATE`, not `TIMESTAMPTZ` — it's a calendar-day label
+  (`window_start.date()` from the same Eastern window triage used), not an
+  instant.
+
+New `db/migrations/004_add_digest_log.sql` (applied by hand against the
+running container, same pattern as the prior three migrations) — just the
+`CREATE TABLE` above. `db/init/001_schema.sql` gets the same block added,
+for fresh installs.
+
+#### `graph/client.py` — new `send_mail`, with retry baked in
+
+Same retry-with-backoff shape as `triage/llm.py`'s `_call_openai` (retry
+baked directly into the function making the call, not split into a
+separate "client" + "retry wrapper" layer — matches the one precedent this
+codebase already has for retry):
+
+```python
+GRAPH_SEND_MAX_RETRIES = 3
+GRAPH_SEND_RETRY_BACKOFF_SECONDS = 2
+
+def send_mail(access_token, to_address, subject, html_body):
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": [{"emailAddress": {"address": to_address}}],
+        }
+    }
+    response = None
+    for attempt in range(GRAPH_SEND_MAX_RETRIES):
+        response = requests.post(
+            f"{config.GRAPH_BASE_URL}/me/sendMail",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json=payload,
+        )
+        if response.ok:
+            return
+        if attempt < GRAPH_SEND_MAX_RETRIES - 1:
+            time.sleep(GRAPH_SEND_RETRY_BACKOFF_SECONDS * (2**attempt))
+    response.raise_for_status()
+```
+
+3 attempts (2s/4s backoff) — a general prophylactic default for transient
+network/Graph hiccups, not tuned against any specific known issue the way
+triage's 5 retries were tuned against the observed OpenAI verification
+flakiness. `to_address` is `config.ACCOUNT_ID` (or the discovered
+`account_id`, same value) — self-send only, matches the existing "self-send
+digest, not general auto-send" decision; no new Graph scope needed
+(`Mail.Send` already granted).
+
+#### `digest/__main__.py` — orchestration
+
+For each account discovered in the window: skip if already sent
+(`digest_log` check) → get a token → fetch that account's grouped summaries
+→ build the HTML body → `send_mail` (retries internally, raises if all
+attempts fail) → only on successful return, `mark_sent`. A send failure
+(all retries exhausted) crashes the run for that account — consistent with
+the established "let it crash, safe to rerun" philosophy — without ever
+re-touching `triage` or marking `digest_log`, exactly as specified.
+
+#### Not doing
+
+No Lambda/EventBridge/scheduling (step 5). No LLM-composed narrative body
+(templated list only, per the decision). No new Graph scope. No
+per-account token storage (flagged gap above, deferred with the rest of
+multi-account OAuth work).
+
+#### Open items — flagging rather than deciding silently
+
+1. HTML vs plain text — recommended HTML above with reasoning; confirm or
+   push back.
+2. Digest email subject line — proposed `"Daily Digest — {digest_date}"`.
+3. The account/token gap above — real limitation, not blocking for a
+   single-account run today.
 
 ### Step 5 — Automation + Guardrails
 
