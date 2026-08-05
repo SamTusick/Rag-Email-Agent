@@ -29,15 +29,17 @@ def build_msal_app():
     return app, cache
 
 
-def get_token_silent():
-    """Returns a valid access token from the cache, or None if interactive
-    login (via /auth/login) is required."""
+def get_token_silent(account_id):
+    """Returns a valid access token for the given account (matched by
+    username) from the cache, or None if interactive login (via
+    /auth/login) is required for that account."""
     app, cache = build_msal_app()
     accounts = app.get_accounts()
-    if not accounts:
+    match = next((a for a in accounts if a.get("username") == account_id), None)
+    if not match:
         return None
 
-    result = app.acquire_token_silent(config.GRAPH_SCOPES, account=accounts[0])
+    result = app.acquire_token_silent(config.GRAPH_SCOPES, account=match)
     _save_cache(cache)
 
     if result and "access_token" in result:

@@ -13,7 +13,7 @@ def create_app():
 
     @app.route("/")
     def fetch_messages():
-        token = get_token_silent()
+        token = get_token_silent(config.ACCOUNT_ID)
         if not token:
             return redirect(url_for("auth.login"))
         return jsonify(get_recent_messages(token))

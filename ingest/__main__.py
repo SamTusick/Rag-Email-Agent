@@ -10,7 +10,7 @@ EXPECTED_EMBEDDING_DIM = 1536
 
 
 def main():
-    token = get_token_silent()
+    token = get_token_silent(config.ACCOUNT_ID)
     if not token:
         print("Not authenticated — log in via /auth/login first.")
         return

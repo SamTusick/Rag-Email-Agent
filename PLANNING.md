@@ -870,8 +870,22 @@ model_not_found` errors (~40-60% failure rate) for a while after OpenAI
 
 ### Step 4 — Daily Digest Dispatch
 
-**Status: proposed, awaiting approval.** Scope per the 2026-08-04 "Digest
-dispatch" decision above. Manual-run only — no Lambda/EventBridge (step 5).
+**Status: done.** Implemented and verified end-to-end — real digest email
+sent via Graph for `stusick@outlook.com` covering 2026-08-03, `digest_log`
+row confirmed, and a second run correctly skipped (no double-send) instead
+of re-sending. Scope per the 2026-08-04 "Digest dispatch" decision above.
+Manual-run only — no Lambda/EventBridge (step 5).
+
+**Data quality issue found and worked around, not fixed at the data
+layer:** `emails`/`email_summaries` contain a leftover `account_id` typo
+(`samtusick@outlook.com`) from an earlier `.env` edit during this session,
+alongside the correct `stusick@outlook.com`. The old `get_token_silent()`
+bug never surfaced this (it ignored `account_id` entirely); the fix above
+correctly does, and skips it safely (`Not authenticated for
+samtusick@outlook.com`) rather than mis-sending. Left as-is rather than
+cleaned up — harmless orphan rows, and self-resolving within a day or two
+as those dates age out of the digest's previous-day window. Could be
+manually deleted later if it's ever distracting.
 
 #### New package: `digest/`
 
@@ -902,15 +916,37 @@ the window, rather than hardcoding `config.ACCOUNT_ID` — matches "for each
 account_id" and sets the shape up correctly for real multi-account support
 later.
 
-**Known gap, flagging rather than hiding it:** `auth.msal_client.get_token_silent()`
-doesn't take an account parameter — it returns whatever's in the single
-shared `token_cache.bin`, regardless of which `account_id` this loop is
-currently on. That's harmless *today* because only one account's data
-exists in the DB. It would send the wrong account's digest to the wrong
-inbox once a second account's data exists, without also building
-per-account token storage — that's the same deferred multi-account OAuth
-work flagged back in step 2's `account_id` migration, not something to
-solve here.
+**Fixed during planning, ahead of building digest:** `get_token_silent()`
+used to always grab `accounts[0]` from the MSAL cache regardless of which
+account was actually wanted — harmless with one account, but would have
+sent one account's digest through a *different* account's authenticated
+mailbox once a second account's data existed, breaking the self-send trust
+boundary. Fixed by matching on username instead:
+
+```python
+def get_token_silent(account_id):
+    app, cache = build_msal_app()
+    accounts = app.get_accounts()
+    match = next((a for a in accounts if a.get("username") == account_id), None)
+    if not match:
+        return None
+    result = app.acquire_token_silent(config.GRAPH_SCOPES, account=match)
+    _save_cache(cache)
+    return result.get("access_token") if result else None
+```
+
+Threaded through as a required parameter at all three call sites
+(`app.py`, `ingest/__main__.py`, and `digest/__main__.py` below) rather than
+left implicit. MSAL's cache already supports holding multiple accounts —
+this was a selection bug, not a storage limitation. Verified by re-running
+`python -m ingest` end-to-end after the change (exit code 0, real Graph
+auth + DB writes).
+
+**Still deferred, and this fix doesn't change that:** the cache itself is
+still one local `token_cache.bin` file, which won't survive on Lambda
+(step 5's ephemeral filesystem) — moving it to a durable per-account store
+(e.g. a Postgres table) is separate follow-up work, not solved by the
+selection fix above.
 
 #### Digest body: simple HTML, not plain text
 
