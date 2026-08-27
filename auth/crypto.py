@@ -1,11 +1,13 @@
 from cryptography.fernet import Fernet
 
-import config
+from auth.secrets import get_token_encryption_key
+
+TOKEN_ENCRYPTION_KEY = get_token_encryption_key()
 
 
 def encrypt(plaintext):
-    return Fernet(config.TOKEN_ENCRYPTION_KEY).encrypt(plaintext.encode()).decode()
+    return Fernet(TOKEN_ENCRYPTION_KEY).encrypt(plaintext.encode()).decode()
 
 
 def decrypt(ciphertext):
-    return Fernet(config.TOKEN_ENCRYPTION_KEY).decrypt(ciphertext.encode()).decode()
+    return Fernet(TOKEN_ENCRYPTION_KEY).decrypt(ciphertext.encode()).decode()

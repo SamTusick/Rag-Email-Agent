@@ -5,6 +5,7 @@ from digest.db import already_sent, get_summaries_for_digest, mark_sent
 from digest.formatting import build_digest_html
 from graph.client import send_mail
 from ingest.db import get_connection
+from triage.db import get_triage_run, get_unprocessed_emails
 from triage.time_window import previous_day_window
 
 
@@ -31,16 +32,27 @@ def main():
                     print(f"No summaries for {account_id} on {digest_date}, skipping")
                     continue
 
+                run = get_triage_run(conn, account_id, digest_date)
+                incomplete = run is None or run["completed_at"] is None
+                unprocessed = (
+                    get_unprocessed_emails(conn, account_id, window_start, window_end)
+                    if incomplete
+                    else []
+                )
+
                 token = get_token_for_account(conn, account_id)
                 if not token:
                     print(f"Could not get a token for {account_id}, skipping.")
                     continue
 
-                html_body = build_digest_html(digest_date, grouped)
+                html_body = build_digest_html(digest_date, grouped, unprocessed)
                 send_mail(token, account_id, f"Daily Digest — {digest_date.isoformat()}", html_body)
 
                 mark_sent(conn, account_id, digest_date)
-                print(f"Sent digest for {account_id} on {digest_date}")
+                if unprocessed:
+                    print(f"Sent digest for {account_id} on {digest_date} (incomplete: {len(unprocessed)} unprocessed)")
+                else:
+                    print(f"Sent digest for {account_id} on {digest_date}")
             except Exception as exc:
                 print(f"Digest failed for {account_id}: {type(exc).__name__}: {exc}")
     finally:

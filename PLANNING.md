@@ -9,11 +9,813 @@ See [CLAUDE.md](CLAUDE.md) for stack overview and build order.
 ## Open Questions
 
 - **Idempotency / failure handling (Step 5):** What prevents a duplicate
-  digest if the job runs twice in a day? What happens if summarization
-  fails partway — does a partial digest send, or does the job abort and
-  alert some other way (log file, fallback "digest failed" email)?
+  digest if the job runs twice in a day? ~~What happens if summarization
+  fails partway...~~ **Closed 2026-08-05** — see the "Partial triage
+  completion tracking" decision below. The duplicate-digest half of this
+  question was already closed by `digest_log` back in step 4; this closes
+  the "what if summarization fails partway" half specifically.
+- **Step 5 full implementation plan (Lambda + EventBridge Scheduler +
+  Supabase migration):** the three architectural sub-decisions below are
+  settled. AWS permissions (approved + attached) and the DB migration/restore
+  (proposal below — **not yet approved**) now have write-ups; Lambda
+  packaging/handler restructuring and EventBridge Scheduler creation are
+  still fully open — per CLAUDE.md's working conventions, still needs
+  approval before any of that code gets written.
 
 ## Decisions
+
+### 2026-08-17 — Step 5 DB migration: restore local backup into Supabase
+
+**Status: PROPOSAL — not approved, not implemented.** Same plan-then-approve
+convention as the prior two Step 5 entries: no restore command, no Secrets
+Manager write, no Supabase project change until this is explicitly approved.
+
+#### Verified before proposing
+
+- `db/init/001_schema.sql`: 7 tables (`emails`, `email_chunks`,
+  `email_summaries`, `digest_log`, `approved_users`, `accounts`,
+  `triage_runs`) plus `CREATE EXTENSION IF NOT EXISTS vector`. Exactly one
+  vector column — `email_chunks.embedding VECTOR(1536)`.
+- Grepped the codebase for pgvector-specific syntax: the only feature in use
+  is the `<=>` cosine-distance operator (`triage/db.py:47`) — no `ivfflat`/
+  `hnsw` index anywhere, consistent with this file's own on-record "No new
+  vector index yet" decision. `<=>` has existed since pgvector 0.4.0
+  (2023), so there's no index-type/version-specific syntax to reconcile —
+  lowers the version-compatibility risk considerably.
+- `config.py` / `ingest/db.py`: confirmed the current shape — five discrete
+  `POSTGRES_HOST`/`PORT`/`DB`/`USER`/`PASSWORD` env vars feed a single
+  `get_connection()` in `ingest/db.py`, imported by every consumer
+  (`app.py`, `digest/__main__.py`, `triage/__main__.py`,
+  `ingest/__main__.py`, `auth/routes.py`) — one change point, not five.
+- `auth/secrets.py` / `auth/crypto.py`: confirmed the exact pattern to
+  mirror — a small `get_*()` function doing one `boto3` `get_secret_value`
+  call, consumed as a module-level constant read once at import time.
+- **Inspected the actual backup file** (not just assumed its shape):
+  `rag-email-agent-backup_2026-08-17.sql`, 1,462 lines, real `pg_dump 16.14`
+  output. Confirmed present: `CREATE EXTENSION IF NOT EXISTS vector WITH
+SCHEMA public;`, a `COMMENT ON EXTENSION vector IS ...` statement, a
+  per-table/per-sequence `ALTER ... OWNER TO postgres;` for all 7 tables,
+  and — notably — a `\restrict <token>` psql meta-command as the very first
+  statement (line 5). All feed directly into point 2 below.
+- **Checked for a local `psql` client — none found**, on either git-bash's
+  PATH or native Windows PATH. This blocks the restore approach in point 2
+  until a client is installed; flagging now rather than discovering it
+  mid-restore.
+
+#### 1. Confirming pgvector is enabled and version-compatible
+
+- Connect with the (not-yet-created) Supabase credentials and run
+  `CREATE EXTENSION IF NOT EXISTS vector;` directly — idempotent, and
+  `vector` is one of Supabase's pre-approved extensions (unlike arbitrary
+  extensions, it doesn't need superuser). The dump's own copy of this
+  statement (line 25) will also run during restore; either order is fine
+  since it's idempotent.
+- Run `SELECT extversion FROM pg_extension WHERE extname = 'vector';` and
+  record the actual version enabled, rather than assuming it's new enough.
+- Given no ANN index is in use (see above), the only real compatibility
+  requirement is that `<=>` exists, which every pgvector version Supabase
+  ships comfortably satisfies — this check is confirmation-for-the-record,
+  not a genuine risk area.
+
+#### 2. Restore approach, and what's different about Supabase's managed Postgres
+
+- **Approach:** `psql "<direct connection string>" -f
+rag-email-agent-backup_2026-08-17.sql` — a plain-SQL dump against
+  wire-compatible Postgres, no special tooling needed once a client exists.
+- **Blocker to resolve first:** no `psql` client is installed locally (see
+  above) — needs installing before this can actually run. Whatever gets
+  installed should be current enough to recognize `\restrict`/`\unrestrict`
+  (see below), not a minimal/old build.
+- **Use the direct connection string (port 5432), not the Supavisor/
+  PgBouncer transaction-mode pooler (port 6543), for the restore itself.**
+  Supabase exposes both; a multi-statement dump restore relies on
+  session-level behavior (sequential DDL + data load in one client session)
+  that transaction-mode pooling isn't designed for. This is a genuine
+  difference from the local Docker instance, which only ever has one
+  connection mode. (Which mode the _application_ should use day-to-day is a
+  separate question for the Lambda-packaging proposal, not decided here —
+  likely direct as well, given this project's low invocation volume, but
+  flagging rather than deciding it inside this entry.)
+- **The `\restrict <token>` line will fail on an old psql client.** This is
+  a psql meta-command backported across supported client versions in a 2025
+  security patch (guards against a dump's data being misinterpreted as
+  psql commands); an outdated client won't recognize it. Directly why the
+  installed-client version matters, not just that a client exists at all.
+- **Ownership statements may throw expected, tolerable errors.** The dump
+  has `ALTER TABLE/SEQUENCE ... OWNER TO postgres;` for every object and one
+  `COMMENT ON EXTENSION vector IS ...`. On Supabase:
+  - If the Supabase connection role is itself named `postgres` (Supabase's
+    project default), the owner-reassignment statements should be harmless
+    no-ops — but confirm the actual role name in the connection string
+    before assuming this holds.
+  - `COMMENT ON EXTENSION` commonly fails with a permission error on managed
+    Postgres, since the extension is typically owned by a Supabase-internal
+    role rather than the connecting one — expect and tolerate this specific
+    error rather than treating it as a sign the restore failed.
+  - Recommend running the first pass as plain `psql -f` (not
+    `--single-transaction`/`ON_ERROR_STOP=1`), so a known-benign statement
+    error doesn't abort otherwise-good data loading — then lean on point 3's
+    row-count/spot-check verification to catch anything that _actually_
+    went wrong, rather than trying to pre-guess and filter every possible
+    harmless error out of the dump file up front.
+
+#### 3. Verifying the restore succeeded
+
+- **Row counts:** `SELECT count(*) FROM <table>;` for each of the 7 tables,
+  run against the still-running local Docker Postgres (source) and Supabase
+  (destination), compared directly — not just "restore completed with no
+  fatal error."
+- **Embedding spot-check:** pick one `email_chunks` row by a stable key
+  (`email_id`, `chunk_index`), fetch `embedding` from both source and
+  destination through `get_connection()`'s existing `register_vector`
+  wiring (so both come back as the same Python-comparable type), and assert
+  exact equality — not just "1536 dimensions on both sides," the actual
+  values.
+- **Indexes/constraints:** confirm `emails_account_id_idx`,
+  `email_chunks_account_id_idx`, `email_summaries_account_id_idx`, the
+  `UNIQUE` constraints, and the FK `ON DELETE CASCADE` relationships exist
+  post-restore (`pg_dump` includes this DDL automatically, so it should
+  come along for free — verify rather than assume, same reasoning as the
+  extension-version check in point 1).
+
+#### 4. Secret creation + config wiring
+
+- **Ordering, matching your framing:** validate the connection string works
+  locally first (points 1–3), _then_ persist it to Secrets Manager — not
+  before. The policy attached in the prior entry already permits
+  `CreateSecret`/`PutSecretValue` on `rag-email-agent/*`.
+- **Secret:** `rag-email-agent/supabase-connection-string`, `us-east-1`,
+  `SecretString` shaped as `{"SUPABASE_CONNECTION_STRING": "postgres://..."}`
+  — mirrors the `{"TOKEN_ENCRYPTION_KEY": "..."}` JSON-object convention
+  `auth/secrets.py` already uses, one consistent shape across every secret
+  rather than a bare string for this one.
+- **`auth/secrets.py`:** new `get_supabase_connection_string()` alongside
+  the existing `get_token_encryption_key()` — same module, same `boto3`
+  client shape, new `SECRET_ID`. Kept in the one module this project already
+  uses for Secrets Manager reads, rather than starting a second one.
+- **`config.py`:** remove all five `POSTGRES_HOST`/`PORT`/`DB`/`USER`/
+  `PASSWORD` variables entirely — not kept alongside a new one — replaced
+  with `SUPABASE_CONNECTION_STRING = get_supabase_connection_string()`,
+  read once at import time. Matches this project's standing convention of
+  retiring the old path outright rather than keeping two (Ollama→OpenAI,
+  `token_cache.bin`→DB tokens, `TOKEN_ENCRYPTION_KEY`→Secrets Manager).
+- **`ingest/db.py::get_connection()`:** change from five keyword arguments
+  to `psycopg.connect(config.SUPABASE_CONNECTION_STRING)` — psycopg accepts
+  a full DSN/URI as a single positional argument. `autocommit = True` and
+  `register_vector(conn)` stay exactly as they are. Every one of the five
+  callers needs zero changes — they all just call `get_connection()`.
+- **`docker-compose.yml` / local Postgres becomes an orphan** once this
+  lands — flagging as optional cleanup, not deleting silently, same
+  treatment `token_cache.bin` got when _it_ was retired.
+- **`.env` / `.env.example`:** remove the five `POSTGRES_*` lines only
+  after the Secrets-Manager path is confirmed working end-to-end — keeping
+  a fallback to compare against mid-change, same sequencing as the
+  `TOKEN_ENCRYPTION_KEY` migration.
+
+#### 5. Implementation-complete checkpoint
+
+Matches your framing: **the local app runs fully against Supabase — no
+local Docker Postgres involved at all — validated against both real
+Microsoft accounts** (`stusick@outlook.com`, `samtusick@outlook.com`),
+re-running `ingest`/`triage`/`digest` for both and confirming behavior
+matches the existing local-Postgres baseline. Same multi-account bar the
+2026-08-04 and 2026-08-05 entries already used. **Explicit checkpoint — stop
+here once that passes.** Not continuing to Lambda packaging or EventBridge
+Scheduler creation in the same pass, per this project's established
+"prep is its own session" discipline (see the 2026-08-16 entry).
+
+#### Not doing (this entry)
+
+No restore commands, no Secrets Manager writes, no Supabase project
+changes, no `config.py`/`ingest/db.py` edits — proposal only. No Lambda
+packaging/handler restructuring, no EventBridge Scheduler creation — those
+stay separate open items per the Open Questions section above.
+
+### 2026-08-17 — Step 5 deployment: AWS permissions gap + least-privilege policy proposal
+
+**Status: APPROVED 2026-08-17, ATTACHED and VERIFIED.**
+`iam:PutRolePolicy` removed from `IamProjectRoles` per your instruction (see
+"Resolved" note under point 2) — `rag-email-agent-deploy` now grants
+`iam:CreateRole`/`GetRole`/`PassRole` only, plus the separately-conditioned
+`AttachRolePolicy` statement. The CLI attach attempt from this session was
+blocked (see point 1 — `rag-email-agent-user` can't grant itself new
+permissions); you attached it manually via the IAM console instead. Verified
+working end-to-end this session — see "Post-attach verification" below.
+
+**Provenance — independently re-verified this session,** closing the gap
+flagged in the original draft:
+
+- `aws sts get-caller-identity` → confirmed the locally configured
+  credentials resolve to `arn:aws:iam::621554168891:user/rag-email-agent-user`
+  in account `621554168891` — matches the account ID used throughout the
+  policy JSON below.
+- `aws iam list-user-policies` / `list-attached-user-policies` for
+  `rag-email-agent-user` → both denied: `AccessDenied ... not authorized to
+perform: iam:ListUserPolicies` (and `ListAttachedUserPolicies`) — this
+  user has _no_ IAM read permissions at all, not even to list its own
+  policies. Consistent with (and stronger evidence than) the secondhand
+  report in point 1: not just "no write access," no IAM visibility
+  whatsoever.
+
+1. **Permissions gap — confirmed directly, not just as reported:**
+   `rag-email-agent-user`'s only working permission is
+   `secretsmanager:GetSecretValue`, scoped to the single
+   `rag-email-agent/token-encryption-key` secret (the 2026-08-16 entry's
+   scope, working as designed). It cannot list/describe/create secrets, and
+   has no IAM role, ECR, Lambda, or EventBridge Scheduler permissions at
+   all. Only one AWS CLI profile exists locally — this same scoped user —
+   so there is no separate broader-permission profile to fall back on; any
+   deploy work requires explicitly widening this policy first.
+
+   **Attach attempt result:** ran
+   `aws iam put-user-policy --user-name rag-email-agent-user --policy-name
+rag-email-agent-deploy --policy-document file://...` using the local
+   `rag-email-agent-user` credentials (the only profile available) →
+   `AccessDenied: ... not authorized to perform: iam:PutUserPolicy on
+resource: user rag-email-agent-user because no identity-based policy
+allows the iam:PutUserPolicy action`. Expected, in hindsight obviously so:
+   the identity attempting the attach _is_ the identity being widened, and
+   it has no `iam:PutUserPolicy`/`iam:AttachUserPolicy` on itself — granting
+   a user new permissions requires a _different_, already-more-privileged
+   identity (the AWS root user, or a separate admin IAM user/role), which
+   doesn't exist in the local CLI config. **Not done from this session** —
+   needs you to attach it via the IAM console (or a CLI profile with
+   IAM-admin rights) using an identity other than `rag-email-agent-user`
+   itself. The JSON below is unchanged and ready to paste in as-is.
+
+2. **Proposed resolution:** a new least-privilege inline policy,
+   `rag-email-agent-deploy`, attached to `rag-email-agent-user`. Scoped by
+   resource-name prefix (`rag-email-agent*`) rather than account-wide
+   wildcards, covering:
+   - **Secrets Manager:** get/describe/create/put/tag, restricted to
+     `rag-email-agent/*` secret ARNs.
+   - **ECR:** `GetAuthorizationToken` — necessarily unscoped, AWS does not
+     support resource-level scoping on this specific action (a documented
+     service limitation, not an oversight) — plus repo-scoped
+     create-repository/push actions.
+   - **Lambda:** create/update/invoke, scoped to `rag-email-agent*`
+     function names.
+   - **IAM:** `CreateRole`/`AttachRolePolicy`/`PassRole`, scoped to
+     `rag-email-agent*` role names.
+   - **EventBridge Scheduler:** create/get/update/delete, scoped to
+     `rag-email-agent*` schedule names.
+
+   **Verbatim policy JSON, as supplied:**
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "SecretsManagerProjectSecrets",
+         "Effect": "Allow",
+         "Action": [
+           "secretsmanager:GetSecretValue",
+           "secretsmanager:DescribeSecret",
+           "secretsmanager:CreateSecret",
+           "secretsmanager:PutSecretValue",
+           "secretsmanager:TagResource"
+         ],
+         "Resource": "arn:aws:secretsmanager:us-east-1:621554168891:secret:rag-email-agent/*"
+       },
+       {
+         "Sid": "EcrAuth",
+         "Effect": "Allow",
+         "Action": "ecr:GetAuthorizationToken",
+         "Resource": "*"
+       },
+       {
+         "Sid": "EcrProjectRepo",
+         "Effect": "Allow",
+         "Action": [
+           "ecr:CreateRepository",
+           "ecr:DescribeRepositories",
+           "ecr:BatchCheckLayerAvailability",
+           "ecr:PutImage",
+           "ecr:InitiateLayerUpload",
+           "ecr:UploadLayerPart",
+           "ecr:CompleteLayerUpload",
+           "ecr:BatchGetImage"
+         ],
+         "Resource": "arn:aws:ecr:us-east-1:621554168891:repository/rag-email-agent*"
+       },
+       {
+         "Sid": "LambdaProjectFunction",
+         "Effect": "Allow",
+         "Action": [
+           "lambda:CreateFunction",
+           "lambda:GetFunction",
+           "lambda:UpdateFunctionCode",
+           "lambda:UpdateFunctionConfiguration",
+           "lambda:InvokeFunction",
+           "lambda:AddPermission",
+           "lambda:GetPolicy"
+         ],
+         "Resource": "arn:aws:lambda:us-east-1:621554168891:function:rag-email-agent*"
+       },
+       {
+         "Sid": "IamProjectRoles",
+         "Effect": "Allow",
+         "Action": ["iam:CreateRole", "iam:GetRole", "iam:PassRole"],
+         "Resource": "arn:aws:iam::621554168891:role/rag-email-agent*"
+       },
+       {
+         "Sid": "IamAttachScopedPolicyOnly",
+         "Effect": "Allow",
+         "Action": "iam:AttachRolePolicy",
+         "Resource": "arn:aws:iam::621554168891:role/rag-email-agent*",
+         "Condition": {
+           "ArnLike": {
+             "iam:PolicyARN": [
+               "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+               "arn:aws:iam::621554168891:policy/rag-email-agent*"
+             ]
+           }
+         }
+       },
+       {
+         "Sid": "SchedulerProjectSchedules",
+         "Effect": "Allow",
+         "Action": [
+           "scheduler:CreateSchedule",
+           "scheduler:GetSchedule",
+           "scheduler:UpdateSchedule",
+           "scheduler:DeleteSchedule"
+         ],
+         "Resource": "arn:aws:scheduler:us-east-1:621554168891:schedule/default/rag-email-agent*"
+       }
+     ]
+   }
+   ```
+
+   **ARN-pattern check, done against this text:**
+   - Secrets Manager, ECR, Lambda, and the two IAM statements all use
+     correctly-formed ARNs for account `621554168891` in `us-east-1`, and
+     the `rag-email-agent*`/`rag-email-agent/*` prefixes are consistent
+     with this project's existing naming (matches `rag-email-agent-deploy`,
+     `rag-email-agent/token-encryption-key`, etc.).
+   - `SchedulerProjectSchedules` assumes the `default` schedule group
+     (`schedule/default/rag-email-agent*`) — correct only if schedules get
+     created without specifying a custom group. Worth a one-line
+     confirmation at implementation time, not a blocker now.
+   - The `IamAttachScopedPolicyOnly` `PolicyARN` condition closes the gap
+     flagged in the previous draft (attaching an unrelated managed policy
+     to a `rag-email-agent*` role) — good fix. But: this policy grants no
+     `iam:CreatePolicy`, so the second allowed ARN pattern,
+     `arn:aws:iam::621554168891:policy/rag-email-agent*`, refers to a
+     customer-managed policy that `rag-email-agent-user` has no way to
+     create itself — it would have to already exist, created out-of-band
+     (e.g. by you, via the IAM console, same manual pattern this project
+     already uses for `approved_users`/allowlist rows). Not wrong, just
+     worth being aware the door is currently latched from the outside, not
+     unreachable by design.
+
+   **Resolved:** the prior draft of this statement also granted
+   unconditioned `iam:PutRolePolicy` on `rag-email-agent*` roles, which
+   reopened the same privilege-escalation path the `AttachRolePolicy`
+   condition was meant to close (an inline policy's contents can't be
+   scoped by any condition key the way a managed policy's ARN can, so
+   `rag-email-agent-user` could have written an arbitrary
+   `"Action":"*","Resource":"*"` inline policy onto any `rag-email-agent*`
+   role and `PassRole`'d it into Lambda). `iam:PutRolePolicy` has been
+   dropped from `IamProjectRoles` entirely — nothing in this project's plan
+   needs inline role policies; `IamAttachScopedPolicyOnly` already covers
+   both things the Lambda execution role actually needs
+   (`AWSLambdaBasicExecutionRole` + a pre-created `rag-email-agent*`
+   managed policy). The JSON above reflects this fix.
+
+3. **DST/scheduling: no correction needed.** Grepped this file for
+   "seasonal", "DST", "cron", and "two schedule" — no prior note about two
+   seasonal EventBridge cron rules exists anywhere in PLANNING.md to
+   supersede. The existing 2026-08-17 "Step 5 infra direction" entry below
+   already settled on EventBridge Scheduler (not classic Rules) with a
+   single schedule using `ScheduleExpressionTimezone=America/New_York`,
+   which already handles the DST offset automatically — this was correct
+   the first time it was written. Noting the discrepancy rather than
+   fabricating a correction to something that was never actually recorded.
+
+4. **Resources reported ready, once this policy is approved and attached:**
+   - Backup file, reported verified:
+     `C:\Users\Stusi\OneDrive - Florida Gulf Coast University\Personal
+Projects\rag-email-agent-backup_2026-08-17.sql`.
+   - Supabase connection string: reported present in `.env` at the repo
+     root (rotated). Not read or reproduced here — `.env` is gitignored and
+     PLANNING.md is not; the value stays out of this file the same way
+     `TOKEN_ENCRYPTION_KEY` never appeared in the 2026-08-16 entry either.
+
+#### Not doing (this entry)
+
+No Supabase migration/Lambda packaging work — this entry is the permissions
+proposal only. DB migration steps, Lambda handler restructuring, and
+Supabase project setup remain open per the Open Questions section above and
+need their own follow-up proposal.
+
+#### Verification plan — all steps complete
+
+1. ~~Re-confirm `rag-email-agent-user`'s current policy state directly~~
+   **Done** — `aws sts get-caller-identity` and the two `list-*-policies`
+   calls above, this session. Confirms point 1's gap independently.
+2. ~~Decide on the flagged `iam:PutRolePolicy` gap~~ **Done** — dropped
+   per your instruction; verbatim JSON updated.
+3. ~~Attach the policy~~ **Done** — blocked from the CLI for the reason in
+   point 1 (`rag-email-agent-user` can't grant itself new permissions); you
+   attached `rag-email-agent-deploy` manually via the IAM console.
+4. ~~After attach, confirm the policy grants exactly what's intended~~
+   **Done — post-attach verification:**
+   - `aws sts get-caller-identity` unchanged (`rag-email-agent-user`,
+     account `621554168891`) — same identity, now with the new policy.
+   - **Positive checks** (each against a nonexistent probe resource named
+     `rag-email-agent-permcheck`, so nothing was actually created):
+     `secretsmanager:DescribeSecret` on the real
+     `rag-email-agent/token-encryption-key` secret succeeded outright;
+     `iam:GetRole`, `lambda:GetFunction`, `ecr:DescribeRepositories`, and
+     `scheduler:GetSchedule` each returned a "not found"-class error
+     (`NoSuchEntity` / `ResourceNotFoundException` /
+     `RepositoryNotFoundException`) rather than `AccessDenied` — proof the
+     permission itself is granted, the resource just doesn't exist yet.
+     Also incidentally confirms the `scheduler/default/...` group-name
+     assumption flagged earlier in point 2 was correct (no group-related
+     error).
+   - **Negative/boundary check:** the same `iam:GetRole` and
+     `lambda:GetFunction` calls against resource names _outside_ the
+     `rag-email-agent*` prefix both got a clean `AccessDenied` — confirms
+     the resource-name-prefix scoping is real and enforced, not
+     accidentally wildcarded to the whole account.
+   - No secrets, role contents, or function code were read or modified by
+     any of the above — every probe targeted either a real secret's
+     metadata (`DescribeSecret`, no value read) or nonexistent resource
+     names.
+
+**Outcome: `rag-email-agent-deploy` is live on `rag-email-agent-user`,
+confirmed scoped exactly as designed.** DB migration steps, Lambda handler
+restructuring, and Supabase project setup remain the next open items per
+the Open Questions section above, each needing its own follow-up proposal
+before implementation.
+
+### 2026-08-17 — Step 5 infra direction: Supabase (not RDS), EventBridge Scheduler with fixed Eastern time, all secrets via Secrets Manager
+
+**Status: settled (architectural direction only) — not yet implemented.**
+These three decisions resolve open questions raised while scoping Step 5
+(Lambda + EventBridge automation) and will anchor that plan once it's
+written up in full; see the Open Questions entry above.
+
+- **Postgres hosting: Supabase, not RDS.** The local Docker container
+  (`docker-compose.yml`, `POSTGRES_HOST=localhost`) is still the only
+  Postgres instance that actually exists today — the 2026-08-03 decision's
+  mention of "RDS Postgres replaces the local Docker Postgres container"
+  was a stated intent, never implemented, and is now superseded by this
+  entry.
+  - **Why:** RDS in a private subnet would force Lambda into VPC
+    configuration for outbound internet access (Graph API, OpenAI, Secrets
+    Manager), which requires a NAT Gateway — a ~$32-35/month fixed cost
+    regardless of usage, for a project whose own history shows real
+    cost-sensitivity (the original Ollama-over-OpenAI-embeddings choice was
+    explicitly to avoid per-token spend) and whose actual scale is small (a
+    handful of accounts, low daily invocation volume). Supabase has
+    first-class pgvector support and a public TLS connection string, so
+    Lambda needs no VPC configuration at all — directly avoiding the exact
+    pain point ("VPC networking is the single biggest source of Lambda
+    deployment pain") that motivated asking the question in the first
+    place.
+  - **Alternatives considered:** RDS in a private subnet (rejected — NAT
+    Gateway cost + VPC complexity, see above); Neon (comparable managed-
+    Postgres option to Supabase, not rejected on merits — Supabase was the
+    one actually chosen, no strong differentiator surfaced between them for
+    this project's needs).
+  - **Known tradeoff, flagged not hidden:** losing RDS's native
+    Secrets-Manager-integrated credential rotation (moot now regardless —
+    that feature is RDS-specific) and adding a non-AWS vendor dependency.
+  - **Revisit if:** Supabase's free/low tier stops covering actual usage,
+    or a future requirement needs same-VPC-as-Lambda networking that a
+    public managed Postgres can't provide.
+- **Schedule: AWS EventBridge Scheduler (not classic EventBridge Rules),
+  fixed Eastern time via `ScheduleExpressionTimezone`.**
+  - **Why:** Classic EventBridge Rules cron expressions are UTC-only, which
+    would mean the digest's local Eastern fire time drifts by an hour
+    across DST transitions. EventBridge Scheduler accepts a timezone
+    directly (`America/New_York`) and handles the DST-driven UTC-offset
+    shift automatically, so the schedule can just say "fire at 7 AM ET" and
+    mean it year-round. This also matches the existing precedent set by the
+    2026-08-04 "Digest time window" decision, which already anchors
+    "today's emails" to Eastern midnight-to-midnight rather than a fixed
+    UTC window for the same human-intuition reason.
+  - **Alternatives considered:** fixed UTC cron via classic EventBridge
+    Rules (rejected — simpler service, but the local fire time visibly
+    drifts twice a year, inconsistent with how the rest of the pipeline
+    already treats Eastern time as the real clock).
+  - **Revisit if:** the user base ever spans multiple timezones (same
+    revisit condition already on record for the digest-window decision —
+    a single fixed timezone stops making sense once it's not just you).
+- **Secrets: all three (`TOKEN_ENCRYPTION_KEY`, `OPENAI_API_KEY`, Postgres/
+  Supabase credentials) via Secrets Manager — not a mix of Secrets Manager
+  and deploy-time env vars.**
+  - **Why:** One retrieval pattern and one IAM policy shape across every
+    secret the Lambda needs, rather than `TOKEN_ENCRYPTION_KEY` going
+    through `auth/secrets.py` while the others sit in plaintext-ish Lambda
+    environment-variable config. Matches this project's repeated preference
+    for one code path over a conditional/mixed one (Ollama→OpenAI,
+    `token_cache.bin`→DB tokens, and this same TOKEN_ENCRYPTION_KEY change
+    itself all retired the old path outright rather than keeping both).
+  - **Alternatives considered:** deploy-time env var injection for
+    `OPENAI_API_KEY`/Postgres credentials, Secrets Manager only for the
+    encryption key (rejected — reintroduces exactly the two-path split the
+    TOKEN_ENCRYPTION_KEY migration was meant to move away from).
+  - **Known tradeoff:** since Postgres is now Supabase rather than RDS (see
+    above), the credentials stored are a Supabase connection
+    string/password, not RDS-rotatable credentials — Secrets Manager here
+    is for centralized storage/IAM-scoped access, not automatic rotation.
+  - **Revisit if:** N/A for now — straightforward extension of the already-
+    approved `TOKEN_ENCRYPTION_KEY` pattern to the other two secrets.
+
+### 2026-08-16 — TOKEN_ENCRYPTION_KEY moves from `.env` to AWS Secrets Manager
+
+**Status: done.** Implemented and verified against real stored tokens for
+both accounts (`samtusick@outlook.com`, `stusick@outlook.com`) — decrypted
+successfully via the Secrets-Manager-sourced key and each redeemed a real
+Microsoft access token, both before and after removing
+`TOKEN_ENCRYPTION_KEY` from `.env` (confirming no silent env-var fallback).
+Closes the flagged gap from the 2026-08-04 multi-user decision ("encryption
+key itself lives in .env for now — should move to AWS Secrets Manager when
+actually deployed to Lambda"). This is the Lambda-deployment prep step; not
+deploying to Lambda itself yet — per the explicit checkpoint, stopping here.
+
+- **Decision:** Read `TOKEN_ENCRYPTION_KEY` from AWS Secrets Manager
+  (secret `rag-email-agent/token-encryption-key`, region `us-east-1`) via a
+  single `boto3` call, replacing the `os.environ["TOKEN_ENCRYPTION_KEY"]`
+  read in `config.py`. One code path, no local/`.env` fallback branch —
+  matches this project's existing convention of retiring old paths outright
+  rather than keeping two (e.g. the Ollama→OpenAI embeddings switch, the
+  `token_cache.bin`→DB token retirement).
+- **Why:** Centralizes secret management ahead of Lambda deployment (step
+  5's automation work) and gets the encryption key off the local
+  filesystem/`.env`, which doesn't exist in Lambda's environment anyway.
+  The IAM permission model (a principal scoped to exactly this secret's
+  ARN, `secretsmanager:GetSecretValue` only) is deliberately built now
+  against a local IAM user so the same policy can be re-attached to a
+  Lambda execution role later with no redesign.
+- **Alternatives considered:** keep `.env` (rejected — doesn't survive
+  Lambda's ephemeral filesystem, same reasoning already applied to
+  `token_cache.bin`); inject the key as a Lambda environment variable at
+  deploy time (rejected — env vars on the function config are visible to
+  anyone with read access to the function itself and aren't centrally
+  rotated/audited the way Secrets Manager entries are; also would mean the
+  local-dev and Lambda paths differ, reintroducing the two-path problem
+  this change is meant to close).
+- **Revisit if:** the key ends up being read per-request instead of once
+  at process/module load — that would make an uncached `GetSecretValue`
+  call on a hot path and should get a caching layer at that point. Not
+  needed today: `config.py` already reads all env-derived config once at
+  import time, and this follows the same shape.
+
+#### Verified before proposing
+
+- Confirmed the secret already exists and its `SecretString` is a JSON
+  object `{"TOKEN_ENCRYPTION_KEY": "..."}` (via `aws secretsmanager
+get-secret-value`, using the scoped local IAM user) — value matches the
+  key currently in `.env` exactly, so swapping the read source is a no-op
+  for already-encrypted data (no re-encryption needed).
+- Confirmed `boto3` is **not** currently installed — needs adding to
+  `requirements.txt`.
+- Grepped the repo for every `TOKEN_ENCRYPTION_KEY` reference: `config.py`
+  (the `os.environ[...]` read — the one call site to change),
+  `auth/crypto.py` (reads `config.TOKEN_ENCRYPTION_KEY`, unaffected — it
+  goes through `config`, not `os.environ`, directly), `.env` and
+  `.env.example` (value/placeholder to remove once confirmed working).
+
+#### Proposed implementation
+
+- **`requirements.txt`:** add `boto3`.
+- **New `auth/secrets.py`:**
+
+  ```python
+  import json
+
+  import boto3
+
+  SECRET_ID = "rag-email-agent/token-encryption-key"
+  REGION = "us-east-1"
+
+
+  def get_token_encryption_key():
+      client = boto3.client("secretsmanager", region_name=REGION)
+      response = client.get_secret_value(SecretId=SECRET_ID)
+      return json.loads(response["SecretString"])["TOKEN_ENCRYPTION_KEY"]
+  ```
+
+  New module rather than adding this to `config.py` itself — `config.py` is
+  a plain env-var-loading module with no AWS dependency today; giving it a
+  network call and a `boto3` import changes its character. `auth/secrets.py`
+  sits next to `auth/crypto.py`, which is the only consumer.
+
+- **`config.py`:** remove the `TOKEN_ENCRYPTION_KEY = os.environ[...]` line
+  entirely (not replaced with a call here — see below).
+- **`auth/crypto.py`:** replace both `config.TOKEN_ENCRYPTION_KEY`
+  references with a module-level `from auth.secrets import
+get_token_encryption_key` call, read once at import time into a
+  module-level constant (`TOKEN_ENCRYPTION_KEY =
+get_token_encryption_key()`), same "read once at load" shape `config.py`
+  already uses for every other value. Keeps the change localized to the
+  one file that actually needs the key, rather than routing it back through
+  `config.py` as a pass-through.
+- **`.env` / `.env.example`:** remove the `TOKEN_ENCRYPTION_KEY` line (and
+  its `.env.example` comment block) once the Secrets Manager path is
+  confirmed working end-to-end — not removed until after verification, so
+  there's a fallback to compare against if something goes wrong mid-change.
+
+#### Not doing
+
+No caching layer (per your explicit scope — revisit condition recorded
+above instead). No IAM role/policy changes (the Lambda-side role is future
+work, explicitly out of scope here — this session only proves the
+application code path against the already-scoped local IAM user). No
+Lambda/EventBridge work — this is prep only, per the explicit checkpoint
+below.
+
+#### Verification plan
+
+1. Compile-check.
+2. Confirm `boto3` installed after `pip install -r requirements.txt`.
+3. Run something that exercises `auth/crypto.py` against a real stored
+   token — e.g. `get_token_for_account` for an existing account in
+   `accounts` — and confirm decryption succeeds (no `InvalidToken`),
+   proving the Secrets-Manager-sourced key matches what originally
+   encrypted the stored refresh token.
+4. Only after step 3 passes: remove `TOKEN_ENCRYPTION_KEY` from `.env` and
+   `.env.example`, re-run step 3 once more to confirm nothing silently fell
+   back to a now-absent env var.
+
+**Explicit checkpoint — stop here.** Implementation-complete after the
+helper is wired in and validated per the verification plan above. Not
+continuing to Lambda/EventBridge work in this session.
+
+### 2026-08-05 — Partial triage completion tracking + explicit partial-digest disclosure
+
+**Status: done.** Implemented and verified — unusually well, via a real
+failure rather than only a simulated one. While re-running `python -m
+triage` to check the normal path, `samtusick@outlook.com` hit a genuine
+`ReadTimeout` from OpenAI mid-batch: first attempt recorded
+`expected_count=23, actual_count=0, completed_at=NULL`; a second attempt
+(after the reset-on-rerun logic) got further before failing again,
+`actual_count=10`; `stusick@outlook.com` completed fully both times
+(`42/42`), confirming failure isolation held across accounts exactly as
+step-4 established. Digest then correctly showed **no** disclosure note for
+that "incomplete" run — because the live `get_unprocessed_emails` query
+(not the stored counters) found every email already had a summary from an
+earlier attempt, proving the counter/live-query split in the design does
+what it was meant to: an "incomplete run" and "actually missing data" are
+different facts, and only the second one should surface to the user. A
+follow-up deliberate test (manually deleting one real summary) confirmed
+the disclosure path itself: console logged
+`(incomplete: 1 unprocessed)`, and a direct call to
+`get_unprocessed_emails` returned exactly that one email
+(subject/sender/timestamp matched precisely). `stusick@outlook.com` sent
+with no note throughout, confirming the ordinary path is unaffected.
+
+#### The tradeoff, walked through (not just picked)
+
+Two real options once digest knows a triage run was incomplete:
+
+1. **Send what's available, explicitly disclosing the gap** (a "Note: N of
+   M emails could not be processed" line, plus — see below — actually
+   listing which ones). Risk: a user could see "digest sent" and assume
+   completeness despite the note; alert-fatigue if this becomes routine.
+2. **Skip sending entirely**, relying on some other alert. Risk: with no
+   fallback alert channel built yet (that's explicitly still open in this
+   same "Idempotency / failure handling" question, and explicitly out of
+   scope for this change), skipping sending means the user gets _nothing_
+   and _no signal anything went wrong_ — strictly worse than option 1 in
+   every case this project can currently detect, since there's no second
+   channel for "the digest didn't come" to be noticed at all.
+
+**Recommendation: option 1, matching your lean — but strengthened beyond a
+bare count.** Rather than just "12 of 65 could not be processed," the
+digest also lists the _specific_ unprocessed emails (subject/sender/time,
+no summary since none exists) so the user has an actual chance to notice
+if something time-sensitive is among what's missing — a bare count gives
+no way to judge that. This is derived live from `emails` minus
+`email_summaries` for the window (not from the stored counters — see
+below), so it's correct even in edge cases the counters might not
+perfectly capture.
+
+#### Schema: new `triage_runs` table
+
+```sql
+CREATE TABLE triage_runs (
+    id             BIGSERIAL PRIMARY KEY,
+    account_id     TEXT NOT NULL,
+    digest_date    DATE NOT NULL,
+    expected_count INT NOT NULL,
+    actual_count   INT NOT NULL DEFAULT 0,
+    completed_at   TIMESTAMPTZ,
+    UNIQUE (account_id, digest_date)
+);
+```
+
+- `digest_date` reuses the exact name/semantics from `digest_log` (the
+  Eastern calendar day the window covers) even though triage writes this
+  row before any digest exists — same concept, same name, easy to reason
+  about across tables.
+- **Considered but rejected: extending `email_summaries` or `digest_log`
+  instead of a new table.** Neither fits — `email_summaries` is one row
+  per _successfully_ summarized email, it has no natural place to record
+  "65 were expected"; `digest_log` only ever gets a row on confirmed
+  _send_, and needs to stay that way (that's what makes retries safe) —
+  overloading it with in-progress triage state would break that invariant.
+  A dedicated table cleanly separates "did triage finish" from "did digest
+  send," which are genuinely different facts about different stages.
+- `completed_at IS NULL` (including no row at all) means "not confirmed
+  complete" — this is the sole gate digest checks. `expected_count`/
+  `actual_count` are recorded for monitoring/debugging visibility (matches
+  what you asked for), but the digest's "which ones are missing" listing
+  uses a live `emails` minus `email_summaries` query instead of trusting
+  these counters, so a hypothetical drift between the counter and reality
+  can't produce a wrong list — only a wrong _count_ in the note, which is
+  strictly less bad.
+
+#### `triage/db.py` — new functions (triage owns writing + reading this table)
+
+- `start_triage_run(conn, account_id, digest_date, expected_count)` —
+  upsert with `actual_count` reset to 0 and `completed_at` reset to `NULL`.
+  **Reset, not accumulated, on rerun** — a rerun re-processes the same
+  window via the already-idempotent `upsert_summary`, so its
+  `triage_runs` row should reflect _this_ run's outcome, not a stale mix
+  with a previous partial attempt.
+- `increment_triage_run(conn, account_id, digest_date)` — `actual_count =
+actual_count + 1`, called inside the _same_ `with conn.transaction():`
+  block as each email's `upsert_summary` — so the counter and the summary
+  write are atomic together; a rolled-back transaction can't increment the
+  counter for a summary that didn't actually persist.
+- `complete_triage_run(conn, account_id, digest_date)` — sets
+  `completed_at = now()`, called only after the per-email loop finishes
+  without an exception escaping it.
+- `get_triage_run(conn, account_id, digest_date)` — read, used by digest.
+- `get_unprocessed_emails(conn, account_id, window_start, window_end)` —
+  `emails` rows in the window with no matching `email_summaries` row
+  (`NOT EXISTS` subquery). This is what actually powers the "N of M" +
+  listing in the digest, not the stored counters.
+
+#### `triage/__main__.py::triage_account` — call `start_triage_run` before
+
+the loop (recording `expected_count = len(emails)`, even when 0 — a
+trivially-complete zero-email day gets `completed_at` set immediately
+rather than leaving an ambiguous "no row"), `increment_triage_run` inside
+each email's existing transaction block, `complete_triage_run` once after
+the loop exits cleanly. If the per-account `except` in `main()` catches an
+exception partway through, `completed_at` simply never gets set —
+correctly signaling incompleteness with no extra bookkeeping needed at the
+crash site itself.
+
+#### `digest/__main__.py` — check before building/sending
+
+After the existing `already_sent`/`grouped`-empty checks (unchanged), add:
+a run is treated as incomplete if `get_triage_run(...)` returns `None` _or_
+`completed_at is None`. If incomplete, fetch
+`get_unprocessed_emails(...)` and pass it to `build_digest_html` for the
+disclosure section; if complete, behave exactly as today. The log line on
+success also notes `(incomplete: N unprocessed)` when applicable.
+
+#### `digest/formatting.py::build_digest_html` — new optional
+
+`unprocessed_emails` parameter. When non-empty, prepend a note ("N emails
+could not be processed today and are listed below") and append an
+"Unprocessed" section listing subject/sender/time for each (no
+summary/urgency — that's exactly what's missing).
+
+#### Known limitation, flagged not hidden
+
+No backfill for `emails`/`email_summaries` rows that already existed
+before this change ships — they have no corresponding `triage_runs` row,
+so a `get_triage_run` lookup for one of those past dates would say
+"incomplete" even though the data is actually fine. Low practical risk
+right now: those specific past dates are already marked `sent` in
+`digest_log`, and the `already_sent` check runs _before_ the triage-run
+check, so digest never reaches this path for them. Would only bite if you
+manually cleared a `digest_log` row for a pre-existing date and re-sent.
+
+#### Not doing
+
+No Lambda/EventBridge, no retry-logic changes, no Secrets Manager work —
+per your explicit scope. No fallback "digest failed" alert channel — that
+remains the other still-open half of step 5's failure-handling question.
+
+#### Verification plan
+
+1. Compile-check.
+2. Apply migration, confirm `triage_runs` exists.
+3. Run `python -m triage` normally for an account with target emails that
+   day — confirm a `triage_runs` row with `completed_at` set and
+   `actual_count == expected_count`.
+4. **Simulate a real partial failure**: temporarily make one email's
+   processing throw partway through a batch (e.g. a deliberately bad
+   value), confirm `completed_at` stays `NULL` and `actual_count <
+expected_count`, and that summaries for the emails processed _before_
+   the failure are still durably present.
+5. Run `python -m digest` against that incomplete day — confirm it sends
+   (not skips), the email actually contains the disclosure note and lists
+   the specific unprocessed subjects, and the console log says
+   `(incomplete: N unprocessed)`.
+6. Confirm the ordinary complete-run path is unaffected — no note, no
+   extra section, matches current output exactly.
 
 <!--
 Format for each entry:
@@ -110,7 +912,7 @@ actually shifts judgment, not just that it runs without erroring.
   the codebase (`triage/llm.py`, `graph/client.py` ×3, `ingest/embeddings.py`)
   set a `timeout`. A connection that never responds (no error, no data)
   blocks `requests` forever — and since the existing retry logic in
-  `triage/llm.py`/`graph/client.py::send_mail` only runs *after* a response
+  `triage/llm.py`/`graph/client.py::send_mail` only runs _after_ a response
   comes back, it couldn't help a call that never returns at all. This is a
   different failure mode than the OpenAI-verification flakiness handled
   earlier (that one always returned an HTTP response, just sometimes a bad
@@ -156,6 +958,7 @@ beyond what's listed below.
 exists yet.
 
 ##### `ingest/__main__.py` and `triage/__main__.py` — extract per-account
+
 helper, loop over `get_all_account_ids`
 
 Fixes a real latent bug: triage's current `if not emails: ...; return`
@@ -164,7 +967,7 @@ extracted into a helper function, that return only exits the helper, so
 the outer loop correctly continues to the next account.
 
 **Failure isolation: one `try/except Exception` per account, wrapping the
-*entire* per-account body**, not just the token fetch narrowly. With only
+_entire_ per-account body**, not just the token fetch narrowly. With only
 the token fetch wrapped, an uncaught crash mid-account (e.g. an embedding
 API error) would abort the whole process and silently skip every remaining
 account until the next scheduled run — the wider catch is what actually
@@ -192,7 +995,7 @@ query against `email_summaries`/`emails` filtered by the time window) to
 behavior — today an account with zero summaries just never appears in the
 loop; with `get_all_account_ids` it would, so add an explicit
 `if not grouped: ...; continue`. Reorder so the two free checks
-(already-sent, has-summaries) happen *before* the token fetch — no point
+(already-sent, has-summaries) happen _before_ the token fetch — no point
 authenticating for an account with nothing to send. `get_account_ids_with_summaries`
 becomes dead code (confirmed via grep: no other callers) — delete it.
 
