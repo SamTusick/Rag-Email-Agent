@@ -2,25 +2,21 @@ import os
 
 from dotenv import load_dotenv
 
+from auth.secrets import get_openai_api_key, get_supabase_connection_string
+
 load_dotenv()
 
-ACCOUNT_ID = os.environ["ACCOUNT_ID"]
 CLIENT_ID = os.environ["CLIENT_ID"]
 AUTHORITY = os.environ["AUTHORITY"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]
 GRAPH_SCOPES = os.environ["GRAPH_SCOPES"].split()
 FLASK_SECRET_KEY = os.environ["FLASK_SECRET_KEY"]
-TOKEN_CACHE_PATH = os.environ.get("TOKEN_CACHE_PATH", "token_cache.bin")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "localhost")
-POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
-POSTGRES_DB = os.environ["POSTGRES_DB"]
-POSTGRES_USER = os.environ["POSTGRES_USER"]
-POSTGRES_PASSWORD = os.environ["POSTGRES_PASSWORD"]
+SUPABASE_CONNECTION_STRING = get_supabase_connection_string()
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY = get_openai_api_key()
 OPENAI_EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1000"))

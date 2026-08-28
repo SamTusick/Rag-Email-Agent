@@ -16,6 +16,7 @@ def get_recent_messages(access_token, top=10):
             "$top": top,
             "$select": "subject,from,receivedDateTime",
         },
+        timeout=30,
     )
     response.raise_for_status()
     return response.json().get("value", [])
@@ -35,6 +36,7 @@ def send_mail(access_token, to_address, subject, html_body):
             f"{config.GRAPH_BASE_URL}/me/sendMail",
             headers={"Authorization": f"Bearer {access_token}"},
             json=payload,
+            timeout=30,
         )
         if response.ok:
             return
@@ -51,6 +53,7 @@ def get_messages_with_body(access_token, top=50):
             "$top": top,
             "$select": "subject,from,receivedDateTime,body",
         },
+        timeout=30,
     )
     response.raise_for_status()
     return response.json().get("value", [])

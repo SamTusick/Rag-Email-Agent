@@ -46,3 +46,25 @@ CREATE TABLE digest_log (
     sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (account_id, digest_date)
 );
+
+CREATE TABLE approved_users (
+    email      TEXT PRIMARY KEY,
+    added_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE accounts (
+    account_id              TEXT PRIMARY KEY,
+    encrypted_refresh_token TEXT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    priority_context         TEXT
+);
+
+CREATE TABLE triage_runs (
+    id             BIGSERIAL PRIMARY KEY,
+    account_id     TEXT NOT NULL,
+    digest_date    DATE NOT NULL,
+    expected_count INT NOT NULL,
+    actual_count   INT NOT NULL DEFAULT 0,
+    completed_at   TIMESTAMPTZ,
+    UNIQUE (account_id, digest_date)
+);

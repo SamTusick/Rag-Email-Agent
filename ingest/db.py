@@ -5,13 +5,7 @@ import config
 
 
 def get_connection():
-    conn = psycopg.connect(
-        host=config.POSTGRES_HOST,
-        port=config.POSTGRES_PORT,
-        dbname=config.POSTGRES_DB,
-        user=config.POSTGRES_USER,
-        password=config.POSTGRES_PASSWORD,
-    )
+    conn = psycopg.connect(config.SUPABASE_CONNECTION_STRING)
     conn.autocommit = True
     register_vector(conn)
     return conn

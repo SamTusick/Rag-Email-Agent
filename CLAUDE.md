@@ -33,9 +33,12 @@ Work proceeds in phases; do not jump ahead of the current phase without discussi
 4. **Daily digest dispatch** _(done)_ — compose a summary of the day's
    emails (grounded in retrieved context) and send it to the user's own
    inbox via `Mail.Send`. Self-send only, hardcoded recipient.
-5. **Automation + guardrails** — run the full pipeline on a daily schedule;
-   add idempotency (no duplicate digest per day) and failure handling before
-   this goes live unattended.
+5. **Automation + guardrails** _(done)_ — full pipeline runs unattended on
+   AWS Lambda (`rag-email-agent-daily`, container image) via EventBridge
+   Scheduler at 7 AM ET. DB is Supabase (session pooler); all secrets in
+   AWS Secrets Manager. Idempotency via `digest_log` / `triage_runs`;
+   failure signal is an in-handler Graph email + Scheduler retry. See the
+   2026-08-28 PLANNING.md entries and `deploy/deploy.md`.
 
 ## Daily Pipeline (target end state)
 
@@ -51,10 +54,12 @@ pipeline is stable — not before.
 
 ## Current Status
 
-Steps 1 through 4 are done and confirmed working end-to-end — a real
-digest email has been sent via Graph. Next up is **step 5: automation +
-guardrails** — not yet started, and not to be implemented until a plan is
-proposed in PLANNING.md and approved.
+Steps 1 through 5 are done and confirmed working end-to-end. The pipeline
+runs unattended on AWS Lambda + EventBridge Scheduler (7 AM ET daily)
+against Supabase, with secrets in AWS Secrets Manager. A scheduled run has
+been observed firing and completing, and real digests have been sent via
+Graph. Redeploy/runbook: `deploy/deploy.md`. Remaining work is small
+follow-ups only (see the 2026-08-28 PLANNING.md entry).
 
 ## Working Conventions
 

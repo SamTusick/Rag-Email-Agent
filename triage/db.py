@@ -76,6 +76,65 @@ def similar_past_emails(conn, account_id, email_id, before, query_embeddings, li
     ]
 
 
+def start_triage_run(conn, account_id, digest_date, expected_count):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO triage_runs (account_id, digest_date, expected_count, actual_count, completed_at)
+            VALUES (%s, %s, %s, 0, NULL)
+            ON CONFLICT (account_id, digest_date) DO UPDATE
+              SET expected_count = EXCLUDED.expected_count,
+                  actual_count = 0,
+                  completed_at = NULL
+            """,
+            (account_id, digest_date, expected_count),
+        )
+
+
+def increment_triage_run(conn, account_id, digest_date):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE triage_runs SET actual_count = actual_count + 1 WHERE account_id = %s AND digest_date = %s",
+            (account_id, digest_date),
+        )
+
+
+def complete_triage_run(conn, account_id, digest_date):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE triage_runs SET completed_at = now() WHERE account_id = %s AND digest_date = %s",
+            (account_id, digest_date),
+        )
+
+
+def get_triage_run(conn, account_id, digest_date):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT expected_count, actual_count, completed_at FROM triage_runs WHERE account_id = %s AND digest_date = %s",
+            (account_id, digest_date),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {"expected_count": row[0], "actual_count": row[1], "completed_at": row[2]}
+
+
+def get_unprocessed_emails(conn, account_id, window_start, window_end):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT e.subject, e.sender, e.received_at
+            FROM emails e
+            WHERE e.account_id = %s AND e.received_at >= %s AND e.received_at < %s
+              AND NOT EXISTS (SELECT 1 FROM email_summaries es WHERE es.email_id = e.id)
+            ORDER BY e.received_at
+            """,
+            (account_id, window_start, window_end),
+        )
+        columns = ["subject", "sender", "received_at"]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
 def upsert_summary(conn, account_id, email_id, summary, urgency):
     with conn.cursor() as cur:
         cur.execute(
