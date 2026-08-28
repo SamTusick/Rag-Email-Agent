@@ -1,151 +1,172 @@
 # Rag-Email-Agent
 
-A RAG-based email agent for Outlook — indexes email content for retrieval
-and (eventually) sends a daily digest summarizing and triaging each day's
-messages by urgency. Supports multiple Outlook accounts, gated by an
-allowlist, so I can use it across my own accounts and eventually share it
-with a small group of others.
+A retrieval-augmented email assistant for Outlook. Once a day it reads a
+mailbox, summarizes the messages that arrived, and sends back a single
+digest with everything grouped by urgency.
 
-See [CLAUDE.md](CLAUDE.md) for the full build order and current status, and
-[PLANNING.md](PLANNING.md) for the design-decision log.
+Every message from the previous day is pulled through the Microsoft Graph
+API, stripped of quoted replies and signatures, split into chunks, embedded,
+and stored in Postgres with pgvector. To summarize a message the agent
+retrieves related context — earlier mail from the same sender, and
+semantically similar messages from the archive — and hands that, together
+with the message itself, to an LLM that writes a short summary and assigns
+an urgency of low, medium, high, or urgent. The day's summaries are grouped
+by urgency into an HTML digest and sent to the account's own inbox. Mail is
+only ever sent to the account it came from; the Graph scopes are limited to
+`Mail.Read` and `Mail.Send`.
 
-## Stack
+The agent handles more than one mailbox. Accounts are added through a
+Microsoft OAuth flow gated by an allowlist, and each account's refresh token
+is encrypted before it is stored. A per-account note can be set in the
+database to tell the model what that mailbox treats as important — for
+instance, that a job-search account should rank recruiter mail highly.
 
-- Python, Flask
-- Postgres + `pgvector` for embedding storage/similarity search (local Docker container)
-- Microsoft Graph API via MSAL (`Mail.Read` + `Mail.Send` scopes, personal Microsoft accounts)
-- OpenAI API (`text-embedding-3-small` for embeddings, `gpt-5-mini` for summarization/triage)
+In the deployed setup the whole pipeline runs on AWS Lambda, triggered once
+a day by EventBridge Scheduler at 7 a.m. Eastern. A log table records each
+send, so a retry after a partial failure does not produce a second digest.
 
-## Status
+## Running your own instance
 
-- ✅ Step 1 — OAuth + basic fetch
-- ✅ Step 2 — Chunk + embed emails into Postgres/pgvector
-- ✅ Step 3 — Retrieval + summarization/triage
-- ✅ Step 4 — Daily digest dispatch
-- ⏳ Step 5 — Automation + guardrails (not started)
-- ✅ Multi-user OAuth + allowlist (encrypted per-account token storage)
+The project is built around a particular set of hosted services. Standing up
+your own copy means creating your own accounts for each of them; nothing
+here depends on my deployment, and once it is configured it runs without any
+involvement from me.
 
-## Setup
+### What you need
 
-The steps below are for **running your own deployment** of this project
-(what I do for local development, and what a cloud deployment would
-require). End users of a running deployment don't do any of this — they
-just authenticate via Microsoft OAuth and, if their email is on the
-allowlist, their account gets provisioned automatically. See PLANNING.md's
-multi-user decision for details.
+- **An Azure app registration** for Microsoft Graph. Register an app under
+  Microsoft Entra ID → App registrations, allow personal Microsoft accounts,
+  add `http://localhost:5000/auth/callback` as a redirect URI, and request
+  delegated `Mail.Read` and `Mail.Send` permissions. The application (client)
+  ID goes in your `.env`.
+- **An OpenAI API key**, used for embeddings (`text-embedding-3-small`) and
+  summarization (`gpt-5-mini`). Usage is minor — cents a day for a couple of
+  mailboxes.
+- **A Postgres database with pgvector.** Production uses a Supabase project
+  reached through its session-mode pooler, but the connection string can
+  point at any Postgres 15 or later with the `vector` extension, including a
+  local one started with `docker compose up`. Apply `db/init/001_schema.sql`
+  once to create the tables.
+- **An AWS account.** Three values are read from AWS Secrets Manager at
+  startup rather than from the environment: the Fernet key that encrypts
+  stored refresh tokens, the database connection string, and the OpenAI key.
+  The region and secret names are set at the top of `auth/secrets.py`. That
+  file is the only place the code touches Secrets Manager, so if you would
+  rather not use AWS it is short enough to repoint at environment variables.
 
-### 1. Azure AD app registration
+### Configuration
 
-Register an app at [portal.azure.com](https://portal.azure.com) → Microsoft
-Entra ID → App registrations. Details (account type, redirect URI, API
-permissions) are documented in [PLANNING.md](PLANNING.md) under Step 1 —
-follow those exactly, since the auth flow depends on the registration
-matching `config.py`/`.env`.
+Copy `.env.example` to `.env` and set `CLIENT_ID`, a random
+`FLASK_SECRET_KEY`, and the authority, redirect, and scope values if they
+differ from the defaults. The remaining entries — chunk size, retrieval
+limits, model names — have working defaults and only need to be set to
+change them.
 
-### 2. OpenAI API key
+Create the three secrets in Secrets Manager, each a JSON object with a
+single key:
 
-Get an API key from [platform.openai.com](https://platform.openai.com) —
-used for chunk embeddings (`text-embedding-3-small`) and summarization/
-triage (`gpt-5-mini`). Cost is negligible at this project's volume.
-
-### 3. Postgres (Docker)
-
-```bash
-docker compose up -d
+```
+rag-email-agent/token-encryption-key        {"TOKEN_ENCRYPTION_KEY": "<fernet key>"}
+rag-email-agent/supabase-connection-string  {"SUPABASE_CONNECTION_STRING": "postgresql://..."}
+rag-email-agent/openai-api-key              {"OPENAI_API_KEY": "sk-..."}
 ```
 
-This starts a `pgvector/pgvector` Postgres container and runs
-`db/init/001_schema.sql` on first boot to create the schema. If the schema
-changes after your container already exists, apply the relevant file(s) in
-`db/migrations/` by hand (see PLANNING.md for the pattern) — `db/init/`
-only runs against a fresh, empty volume.
+Generate the Fernet key with:
 
-### 4. Python environment
+```
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
 
-```bash
+Your local AWS credentials (`aws configure`) need permission to read these
+secrets.
+
+### Python environment
+
+```
 python -m venv .venv
-source .venv/Scripts/activate   # Git Bash on Windows; use .venv\Scripts\Activate.ps1 for PowerShell
+source .venv/Scripts/activate      # PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 5. Configure `.env`
+### Authorizing a mailbox
 
-```bash
-cp .env.example .env
-```
-
-Fill in `CLIENT_ID` (from the Azure app registration), a random
-`FLASK_SECRET_KEY`, `OPENAI_API_KEY`, a `TOKEN_ENCRYPTION_KEY` (generate
-with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
-— **temporary**: lives in `.env` for local dev only, must move to AWS
-Secrets Manager before actual Lambda deployment), and Postgres credentials
-(these initialize the Docker container, so pick values before first
-running `docker compose up`, or run `docker compose down -v` to reinit if
-you change them after — this wipes local dev data). See `.env.example` for
-the full list with comments.
-
-### 6. Approve at least one account
-
-No admin UI — add yourself (and anyone else) to the allowlist directly:
+There is no admin interface. Add each address to the allowlist directly:
 
 ```sql
 INSERT INTO approved_users (email) VALUES ('you@outlook.com');
 ```
 
-## Running
+Then start the Flask app and sign in:
 
-**Authenticate:**
-
-```bash
+```
 python app.py
 ```
 
-Visit `http://localhost:5000/auth/login` and sign in with an approved
-Microsoft account. On success, your account's OAuth refresh token is
-encrypted and stored in the `accounts` table — this is what every command
-below uses instead of any per-account `.env` setting. A non-approved
-account gets a clean rejection with nothing stored.
+Open `http://localhost:5000/auth/login`, authenticate with the mailbox you
+allowlisted, and grant consent. The callback checks the address against
+`approved_users` and, on success, stores that account's encrypted refresh
+token. An address that is not on the list is rejected and nothing is saved.
+Repeat for each mailbox.
 
-**Ingest, triage, and digest all process every provisioned account (every
-row in `accounts`) in one run — no per-account `.env` swapping:**
+### Running the pipeline
 
-```bash
-python -m ingest    # fetch, clean, chunk, embed, store — safe to re-run
-python -m triage     # summarize + grade urgency for yesterday's emails (Eastern)
-python -m digest      # send each account's digest, tracked in digest_log to avoid double-sends
-```
-
-A failure acquiring a token for one account (e.g. a revoked grant) is
-logged and skipped — it doesn't stop the other accounts in the same run.
-
-## Project layout
+The three stages run in order, and each one processes every authorized
+account:
 
 ```
-app.py                  # Flask app: /, redirects to auth if not logged in
-config.py               # env var loading
+python -m ingest     # fetch, clean, chunk, embed
+python -m triage     # summarize and grade the previous day's mail
+python -m digest     # send each account's digest
+```
+
+`ingest` is safe to run repeatedly. `triage` works on the previous calendar
+day in US Eastern time. `digest` records each send in `digest_log` and will
+not send a day's digest twice. A failure on one account, such as a revoked
+grant, is logged and skipped without affecting the others.
+
+Running these on a local scheduler — cron, or Task Scheduler on Windows — is
+enough to use the agent day to day.
+
+### Deploying to AWS
+
+`deploy/` holds a container build and a runbook for the Lambda and
+EventBridge Scheduler setup. `deploy/deploy.md` lists the commands to create
+the image repository, the function, its execution role, and the daily
+schedule, along with what to run to push later code changes.
+
+## Repository layout
+
+```
+app.py                  Flask app, used only for the OAuth sign-in flow
+lambda_handler.py       AWS Lambda entry point; runs ingest, triage, digest in order
+config.py               configuration, from the environment and Secrets Manager
 auth/
-  accounts.py            # accounts/approved_users table access, DB-backed token acquisition
-  crypto.py               # Fernet encrypt/decrypt for stored refresh tokens
-  msal_client.py           # builds the MSAL app
-  routes.py                 # /auth/login, /auth/callback (allowlist-gated)
+  accounts.py           accounts / approved_users tables, token acquisition
+  crypto.py             Fernet encryption for stored refresh tokens
+  msal_client.py        MSAL application setup
+  routes.py             /auth/login and /auth/callback, allowlist-gated
+  secrets.py            reads secrets from AWS Secrets Manager
 graph/
-  client.py              # Graph API calls (message list, message list w/ body, send mail)
+  client.py             Microsoft Graph calls: list messages, fetch bodies, send mail
 ingest/
-  cleaning.py            # HTML stripping, quoted-reply/signature stripping
-  chunking.py            # character-based chunking
-  embeddings.py          # OpenAI embedding calls
-  db.py                  # Postgres connection + upsert/replace helpers
-  __main__.py             # ingestion orchestration (python -m ingest)
+  cleaning.py           HTML and quoted-reply/signature stripping
+  chunking.py           character-based chunking
+  embeddings.py         OpenAI embedding requests
+  db.py                 database connection and write helpers
+  __main__.py           ingestion run (python -m ingest)
 triage/
-  time_window.py          # previous-day Eastern window (zoneinfo)
-  db.py                    # retrieval queries + summary upsert
-  llm.py                    # OpenAI summarization/urgency call
-  __main__.py               # triage orchestration (python -m triage)
+  time_window.py        previous-day Eastern window
+  db.py                 retrieval queries and summary writes
+  llm.py                summarization and urgency call
+  __main__.py           triage run (python -m triage)
 digest/
-  db.py                    # digest queries + digest_log tracking
-  formatting.py             # HTML digest body
-  __main__.py                # digest orchestration (python -m digest)
-db/init/                # Postgres schema, applied on first container boot
-db/migrations/          # hand-applied schema changes for existing containers
-docker-compose.yml       # local Postgres/pgvector container
+  db.py                 digest queries and send tracking
+  formatting.py         HTML digest body
+  __main__.py           digest run (python -m digest)
+db/init/                schema, applied once to a new database
+db/migrations/          later schema changes, applied by hand
+deploy/                 container build and AWS deployment runbook
+docker-compose.yml      local Postgres/pgvector, an alternative to Supabase in development
 ```
+
+Design decisions and the reasoning behind them are recorded in PLANNING.md.
