@@ -60,7 +60,8 @@ def triage_account(conn, account_id, digest_date, window_start, window_end):
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     window_start, window_end = previous_day_window()
     digest_date = window_start.date()
     conn = get_connection()

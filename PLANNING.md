@@ -14,21 +14,117 @@ See [CLAUDE.md](CLAUDE.md) for stack overview and build order.
   completion tracking" decision below. The duplicate-digest half of this
   question was already closed by `digest_log` back in step 4; this closes
   the "what if summarization fails partway" half specifically.
-- **Step 5 full implementation plan (Lambda + EventBridge Scheduler +
-  Supabase migration):** the three architectural sub-decisions below are
-  settled. AWS permissions (approved + attached) and the DB migration/restore
-  (proposal below — **not yet approved**) now have write-ups; Lambda
-  packaging/handler restructuring and EventBridge Scheduler creation are
-  still fully open — per CLAUDE.md's working conventions, still needs
-  approval before any of that code gets written.
+- **Step 5 full implementation (Lambda + EventBridge Scheduler + Supabase
+  migration): DONE 2026-08-28.** All sub-parts landed and verified — see the
+  three 2026-08-28 entries (DB migration; Lambda packaging + Scheduler) and
+  the 2026-08-17 infra-direction entry. The pipeline runs unattended on
+  Lambda at 7 AM ET. Remaining items are non-blocking follow-ups listed at
+  the end of the 2026-08-28 Lambda entry (`ingest` skip-already-embedded,
+  reserved concurrency, memory trim, CloudWatch alarm).
 
 ## Decisions
 
 ### 2026-08-17 — Step 5 DB migration: restore local backup into Supabase
 
-**Status: PROPOSAL — not approved, not implemented.** Same plan-then-approve
-convention as the prior two Step 5 entries: no restore command, no Secrets
-Manager write, no Supabase project change until this is explicitly approved.
+**Status: DONE 2026-08-28.** Approved as written, then adapted in two ways
+forced by what turned up on the day (both documented below). Data is in
+Supabase and verified; the code connects to it via Secrets Manager; the full
+`ingest`/`triage`/`digest` pipeline has been re-run against Supabase for both
+accounts. The local Docker Postgres is now an orphan (kept as rollback path).
+**Checkpoint reached — stop here.** Lambda packaging and EventBridge
+Scheduler are the next items, each needing its own proposal.
+
+#### Deviations from the plan as originally written
+
+1. **Restore method: not `psql -f` against the dump file.** Two reasons the
+   dump/`psql` path was abandoned:
+   - **Direct connection host is IPv6-only and this machine has no IPv6
+     route.** `db.qdsepwdpjrdexilyzjlb.supabase.co` resolves to an AAAA
+     record only, no A record — `getaddrinfo` for IPv4 fails with what
+     looks like NXDOMAIN. Supabase made direct connections IPv6-only unless
+     the paid IPv4 add-on is bought. The working IPv4 path is the
+     **Supavisor pooler** (`aws-0-us-east-1.pooler.supabase.com:5432`,
+     **session mode** — the plan's warning was only about *transaction*
+     mode / port 6543). The `.env` / secret connection string uses the
+     session pooler. Username for the pooler must be
+     `postgres.<project-ref>`, not bare `postgres`.
+   - **No usable `psql`/`pg_dump` client on the machine** (`C:\Program
+     Files\PostgreSQL\18\bin` has only `pgagent.exe`), and the Aug-17 dump
+     file that was found (`C:\Personal Projects\rag-email-agent-backup_
+     2026-08-17.sql`, 1,283 lines vs. the 1,462 originally inspected) was
+     stale anyway.
+   - **What was done instead:** a one-off Python script
+     (`scratchpad/migrate_to_supabase.py`, not committed) that creates the
+     schema on Supabase directly from `db/init/001_schema.sql` (the
+     canonical current schema — no dump DDL to reconcile), then streams
+     each of the 7 tables local→Supabase with `COPY ... TO STDOUT` /
+     `COPY ... FROM STDIN` in FK-safe order, resets the 5 `BIGSERIAL`
+     sequences with `setval`, and verifies. Avoids the dump file, the
+     `psql` install, and re-paying for embeddings.
+   - **Verification (all passed):** row counts source-vs-dest identical for
+     all 7 tables (emails 221, email_chunks 590, email_summaries 126,
+     digest_log 3, approved_users 2, accounts 2, triage_runs 2); one
+     `email_chunks.embedding` compared as text between source and dest —
+     exact match; all indexes/PK/unique constraints present on the
+     destination (created by `001_schema.sql`); pgvector 0.8.2 on Supabase,
+     `<=>` confirmed working through the app's `get_connection()`.
+
+2. **Secret + config wiring — done as planned, with the connection string
+   pointing at the session pooler.**
+   - Secret `rag-email-agent/supabase-connection-string` created in
+     `us-east-1`, `SecretString` = `{"SUPABASE_CONNECTION_STRING": "..."}`.
+     Readback matches `.env`. ARN suffix `-cgni2b`.
+   - `auth/secrets.py`: refactored to a shared `_get_secret(secret_id, key)`
+     helper; added `get_supabase_connection_string()` alongside the existing
+     `get_token_encryption_key()`.
+   - `config.py`: the five `POSTGRES_*` variables removed; replaced with
+     `SUPABASE_CONNECTION_STRING = get_supabase_connection_string()` (read
+     once at import). `config.py` now imports from `auth.secrets` — no
+     circular import (`auth/secrets.py` pulls in only `json` + `boto3`).
+   - `ingest/db.py::get_connection()`: now
+     `psycopg.connect(config.SUPABASE_CONNECTION_STRING)`; `autocommit` and
+     `register_vector(conn)` unchanged. All five callers unchanged.
+   - Compile-check clean; `get_connection()` confirmed reading/writing
+     Supabase with `register_vector` + `<=>` working.
+
+#### Pipeline re-validation — done 2026-08-28
+
+Clock rolled Aug 27→28 mid-session, so this covered two windows:
+- `ingest`: both accounts, 50 messages each fetched → Supabase. `emails`
+  221→321, `email_chunks` 590→927, all embeddings written via the app's
+  `get_connection()` + `register_vector`. Vector inserts confirmed.
+- `triage` (ran on Aug 27, window = Aug 26): 23 emails, both accounts,
+  `triage_runs` complete (16/16, 7/7). Retrieval `<=>` over Supabase
+  pgvector confirmed.
+- `triage` (re-run on Aug 28, window = Aug 27): 52 emails, both accounts,
+  `triage_runs` complete (9/9, 43/43). `email_summaries` → 201.
+- `digest` (Aug 28, window = Aug 27): real digests sent via Graph to both
+  `samtusick@outlook.com` and `stusick@outlook.com`; `digest_log` rows
+  written for 2026-08-27; `already_sent` idempotency intact.
+
+#### Cleanup done
+
+- `.env`: the five `POSTGRES_*` lines commented out (not deleted — kept for
+  the orphaned local-docker fallback / rollback path). Nothing in the app
+  references them (`grep POSTGRES_ **/*.py` → 0 hits). `config.SUPABASE_
+  CONNECTION_STRING` present, `config.POSTGRES_HOST` gone.
+- `.env.example`: `POSTGRES_*` block replaced with a Supabase / Secrets
+  Manager note.
+- `SUPABASE_CONNECTION_STRING` left in `.env` — still read by the
+  non-committed `scratchpad/migrate_to_supabase.py` and handy for ad-hoc
+  scripts; the app itself does not read it (only Secrets Manager).
+- `docker-compose.yml` untouched — still references `POSTGRES_*`, so
+  bringing the local DB up now needs those vars passed explicitly. Left as
+  an orphan per the original plan; tear down + delete compose file when the
+  rollback path is no longer wanted.
+
+#### Still deferred
+
+- Whether the *deployed Lambda* should use the session pooler, the
+  transaction pooler, or direct+IPv6 — deferred to the Lambda-packaging
+  proposal.
+- `OPENAI_API_KEY` → Secrets Manager (the third secret per the 2026-08-17
+  infra-direction entry) — not done here; belongs with the Lambda work.
 
 #### Verified before proposing
 
@@ -190,6 +286,272 @@ No restore commands, no Secrets Manager writes, no Supabase project
 changes, no `config.py`/`ingest/db.py` edits — proposal only. No Lambda
 packaging/handler restructuring, no EventBridge Scheduler creation — those
 stay separate open items per the Open Questions section above.
+
+### 2026-08-28 — Step 5 Lambda packaging + EventBridge Scheduler
+
+**Status: APPROVED 2026-08-28 — IN PROGRESS.** Builds on the now-DONE DB
+migration entry above and the settled 2026-08-17 infra-direction entry.
+
+Progress against the verification plan:
+1. ✅ `OPENAI_API_KEY` → Secrets Manager (`rag-email-agent/openai-api-key`,
+   ARN suffix `-QyDpVV`); `auth/secrets.py` `get_openai_api_key()` +
+   shared `_get_secret`; `config.py` reads it; `.env`/`.env.example`
+   annotated; both `sys.stdout.reconfigure` calls guarded with `hasattr`
+   for the Lambda runtime. Verified locally (embeddings + triage LLM) and
+   from inside the built container.
+2. ✅ Image built (`Dockerfile`, `.dockerignore`, `lambda_handler.py`);
+   run via the Lambda RIE — INIT + handler dispatch + Secrets-Manager IAM +
+   `ingest` (both accounts) + `triage` all confirmed working in-container.
+   The RIE's own hard 300 s cap cut the run off mid-`triage`; measured
+   phase timings extrapolate to ~6 min for a full run (ingest ~2.5,
+   triage ~3.5 for a heavy 52-email day), so the 900 s function timeout
+   has margin. Not a real-Lambda limit.
+3. ✅ ECR repo `rag-email-agent` created + image `:latest` pushed
+   (`--provenance=false --sbom=false` — Lambda rejects BuildKit's default
+   OCI manifest-list output). Roles `rag-email-agent-lambda-exec`
+   (+`AWSLambdaBasicExecutionRole` +`rag-email-agent-lambda-secrets`) and
+   `rag-email-agent-scheduler` (+`rag-email-agent-scheduler-invoke`)
+   created. Function `rag-email-agent-daily` created (image, 900 s,
+   1024 MB, x86_64), State=Active.
+   - **Gap 1:** deploy policy lacked `ecr:SetRepositoryPolicy` — needed for
+     the ECR repo policy that lets `lambda.amazonaws.com` pull the image
+     (console auto-adds it, CLI doesn't). User added
+     `ecr:SetRepositoryPolicy`/`GetRepositoryPolicy` to
+     `rag-email-agent-deploy-policy`; repo policy then set
+     (`LambdaECRImageRetrievalPolicy`, source-ARN-scoped to
+     `function:rag-email-agent*`).
+   - **Gap 2:** deploy policy lacks `lambda:PutFunctionConcurrency` —
+     reserved concurrency 1 was skipped. Low priority (a once-daily ~6-min
+     job can't realistically overlap; idempotency guards cover it anyway).
+     Optional follow-up: add the action + set it.
+4. ✅ Manual `aws lambda invoke` — `{"status":"ok"}`, all 3 phases ran,
+   `digest` correctly skipped both accounts (Aug 27 already sent).
+   **Duration 344 s / max memory 153 MB** of 1024 — the 900 s timeout has
+   comfortable margin; memory could drop to 512 MB later to trim cost.
+5. ✅ Failure path — verified locally (the deployed function is hard to
+   force-fail from outside because the per-account `try/except` isolation
+   from the 2026-08-04 work swallows single-account errors by design — a
+   good finding: a bad embedding model just logged `Ingest failed for
+   {account}` and the run still returned `ok`). Direct tests:
+   `_notify_failure(...)` sent a "pipeline FAILED" Graph email; and
+   `handler()` with a monkeypatched phase that raises → caught → notified →
+   **re-raised** (so Lambda records the error + Scheduler retries).
+6. ✅ Schedule created (`rag-email-agent-daily`, `cron(0 7 * * ? *)`
+   `America/New_York`, retry 2×/1 h). Scheduler→Lambda wiring proven with a
+   one-off `at()` schedule: it fired on time and the pipeline ran to
+   completion (`email_summaries.generated_at` and both `triage_runs`
+   advanced past the fire time). One-off schedule deleted afterward.
+7. ✅ Idempotency — the step-4 invoke already showed `digest` skipping the
+   already-sent day; the scheduled run did the same.
+
+**Step 5 COMPLETE.** The daily digest pipeline runs unattended on Lambda at
+7 AM ET, with idempotency (`digest_log`/`triage_runs`) and an in-handler
+Graph failure-email + Scheduler retry as guardrails.
+
+Follow-ups (each its own small change, none blocking):
+- `ingest` skip-already-embedded (cuts ~half the run time / the timeout risk).
+- Grant `lambda:PutFunctionConcurrency`, set reserved concurrency 1.
+- Drop function memory to 512 MB (153 MB used).
+- Proper CloudWatch alarm / SNS (needs perms outside the deploy policy).
+
+Original proposal preserved below for the reasoning.
+
+#### Verified before proposing
+
+- **What the batch path actually reads from `config`** (grepped
+  `ingest/ triage/ digest/ graph/ auth/`): `SUPABASE_CONNECTION_STRING`
+  (Secrets Manager, done), `OPENAI_API_KEY` (still `os.environ` — see
+  below), `GRAPH_BASE_URL` (hardcoded constant), `CLIENT_ID`, `AUTHORITY`,
+  `GRAPH_SCOPES` (all plain, non-secret), and the tuning knobs
+  `OPENAI_EMBEDDING_MODEL` / `CHUNK_SIZE` / `CHUNK_OVERLAP` /
+  `SUMMARIZATION_MODEL` / `SENDER_CONTEXT_LIMIT` / `GROUNDING_LIMIT` /
+  `CONTEXT_SNIPPET_CHARS` (all have code defaults).
+- **`REDIRECT_URI` and `FLASK_SECRET_KEY` are Flask-web-only** — used only
+  by `app.py` / `auth/routes.py`, never by the batch pipeline. But
+  `config.py` reads both with `os.environ[...]` at import, so they'd
+  `KeyError` in Lambda unless set. Decision below: set them as (harmless /
+  dummy) Lambda env vars rather than restructuring `config.py`, keeping its
+  fail-fast behavior for the web app intact.
+- **Refresh-token redemption needs no redirect URI** —
+  `auth/accounts.py::get_token_for_account` calls
+  `acquire_token_by_refresh_token(refresh_token, GRAPH_SCOPES)` only; the
+  `redirect_uri` arg lives solely in `auth/routes.py`'s auth-code path.
+  Confirms the Lambda never touches the OAuth callback flow.
+- **`ingest` re-embeds every message in the top-50 every run**
+  (`ingest/__main__.py` embeds before the `graph_message_id` upsert check),
+  i.e. ~150 embedding calls/account/run of pure rework. Trivial cost
+  (`text-embedding-3-small`), but it's the main avoidable chunk of wall time
+  and the main timeout risk. Flagged as a recommended companion change, not
+  a blocker (see "Not doing").
+- **IAM policies the deploy user can't self-create — reported created by
+  the user 2026-08-28** (console): `rag-email-agent-lambda-secrets`
+  (Secrets Manager read on `rag-email-agent/*`) and
+  `rag-email-agent-scheduler-invoke` (`lambda:InvokeFunction` on
+  `rag-email-agent*`). `rag-email-agent-user` has no `iam:GetPolicy`, so
+  these can't be verified from the local CLI — first real deploy step will
+  confirm them by attaching.
+- **No VPC needed** — Supabase session pooler is public TLS/IPv4 (migration
+  entry above), so the Lambda runs with default networking and reaches
+  Graph / OpenAI / Secrets Manager / Supabase directly. This was the whole
+  reason Supabase was chosen over RDS (2026-08-17 infra entry).
+- **`docker` / `aws` CLIs present**; Docker Desktop must be running for the
+  image build (it was stopped earlier this session — user restarted it).
+
+#### 1. Packaging: one container image, one Lambda function
+
+- **Container image, not a zip.** The deploy policy is already built around
+  ECR (`CreateRepository`, `PutImage`, layer uploads), and
+  `psycopg[binary]` / `cryptography` / `pgvector` pull platform wheels that
+  are a headache to assemble for a zip on Windows. Base image
+  `public.ecr.aws/lambda/python:3.12`, `pip install -r requirements.txt`
+  into `${LAMBDA_TASK_ROOT}`, copy the source tree, `CMD
+  ["lambda_handler.handler"]`.
+- **Keep the single `requirements.txt`** (flask/msal ride along unused —
+  ~a few MB, not worth a second file and the drift risk).
+- **One function, `rag-email-agent-daily`, running all three phases in
+  sequence** — not three functions, not Step Functions. Step Functions
+  isn't in the deploy policy at all, which is a deliberate signal from the
+  2026-08-17 permissions design that the intended shape is
+  Scheduler→one-Lambda. `lambda_handler.handler` calls, in the existing
+  `python -m` order: `ingest.__main__.main()` → `triage.__main__.main()` →
+  `digest.__main__.main()`.
+- **Timeout 900 s (the max), memory 1024 MB.** Observed local wall time for
+  a full run this session was well under that, but with no margin to spare
+  once email volume is higher — hence also recommending the `ingest`
+  skip-existing change below. If a run ever does time out, the existing
+  `triage_runs` / `digest_log` idempotency makes the Scheduler retry safe.
+- **New file `lambda_handler.py` at repo root.** Thin: set up logging, call
+  the three `main()`s, let exceptions propagate (see §4).
+
+#### 2. `OPENAI_API_KEY` → Secrets Manager (the third secret)
+
+Per the 2026-08-17 infra-direction entry ("all three secrets via Secrets
+Manager, not a mix"). This is the remaining one.
+
+- **New secret** `rag-email-agent/openai-api-key`, `us-east-1`,
+  `SecretString` = `{"OPENAI_API_KEY": "..."}` — same JSON-object shape as
+  the other two.
+- **`auth/secrets.py`:** add `get_openai_api_key()` using the existing
+  `_get_secret(secret_id, key)` helper and a new
+  `OPENAI_API_KEY_SECRET_ID` constant.
+- **`config.py`:** `OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]` becomes
+  `OPENAI_API_KEY = get_openai_api_key()`. One path, no env fallback —
+  matches the `SUPABASE_CONNECTION_STRING` and `TOKEN_ENCRYPTION_KEY`
+  precedents. Affects local runs too (they'll read from Secrets Manager
+  like everything else already does).
+- **`.env` / `.env.example`:** comment out / annotate `OPENAI_API_KEY`
+  after the Secrets Manager path is confirmed working locally, same
+  sequencing as the DB migration.
+
+#### 3. Lambda configuration
+
+- **Execution role `rag-email-agent-lambda-exec`** — created by
+  `rag-email-agent-user` (`iam:CreateRole`, allowed for `rag-email-agent*`).
+  Trust policy: `lambda.amazonaws.com`. Attached policies (both permitted by
+  the deploy policy's `IamAttachScopedPolicyOnly` condition):
+  `arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole` +
+  `rag-email-agent-lambda-secrets`.
+- **Environment variables on the function** (all non-secret):
+  `CLIENT_ID`, `AUTHORITY=https://login.microsoftonline.com/consumers`,
+  `GRAPH_SCOPES=Mail.Read Mail.Send`,
+  `REDIRECT_URI=http://localhost:5000/auth/callback` (unused by the batch
+  path, set only to satisfy `config.py`'s import),
+  `FLASK_SECRET_KEY=unused-in-lambda` (likewise). Optionally the tuning
+  knobs if we want to override the code defaults — otherwise omit.
+- **Region:** `auth/secrets.py` already hardcodes `us-east-1`; the function
+  lives in `us-east-1`; the three secrets are in `us-east-1`. Consistent.
+- **Reserved concurrency: 1.** A daily job should never run two copies at
+  once, and it caps Supabase pooler connections.
+
+#### 4. Guardrails (the "+ guardrails" half of Step 5)
+
+- **Idempotency: already built and proven.** `digest_log` (no double
+  send/day) and `triage_runs` (partial-completion tracking, 2026-08-05
+  entry) already make a re-run of the whole pipeline safe. Nothing new
+  needed here — this was the point of building them.
+- **Failure signal: in-handler, via the channel that already exists.**
+  `lambda_handler.handler` wraps the three phases; on an unhandled
+  exception it attempts a plain-text failure email through the existing
+  `graph.client.send_mail` (using the first account whose token still
+  redeems), then **re-raises** so Lambda records the error and the
+  Scheduler retry fires. No SNS topic / CloudWatch alarm / new IAM in v1 —
+  those need permissions the deploy policy doesn't have and a
+  subscription-confirmation dance; the Graph email reuses working code and
+  the same `Mail.Send` scope. Known hole, stated not hidden: if the failure
+  is in auth or Graph itself, the notification can't send — the CloudWatch
+  `Errors` metric + Scheduler DLQ (below) are the backstop, and a proper
+  alarm can be a later follow-up.
+- **Scheduler retry + DLQ:** `MaximumRetryAttempts: 2`,
+  `MaximumEventAgeInSeconds: 3600`. DLQ deferred unless we add SQS perms —
+  noting rather than silently skipping.
+
+#### 5. EventBridge Scheduler
+
+- **Schedule `rag-email-agent-daily`, group `default`** (the deploy policy's
+  ARN pattern is `schedule/default/rag-email-agent*`, verified correct in
+  the 2026-08-17 permissions entry).
+- **`ScheduleExpression: cron(0 7 * * ? *)`,
+  `ScheduleExpressionTimezone: America/New_York`** — fires 7:00 AM ET
+  year-round, DST handled by the service (2026-08-17 infra entry). 7 AM is
+  comfortably after Eastern midnight so `triage.time_window.previous_day_
+  window()` resolves to "yesterday" cleanly, and the digest lands at a
+  sensible reading time.
+- **`FlexibleTimeWindow: { Mode: "OFF" }`**, target = the function ARN,
+  `RoleArn` = **`rag-email-agent-scheduler`** (new role, trust
+  `scheduler.amazonaws.com`, attached policy
+  `rag-email-agent-scheduler-invoke`).
+
+#### 6. Deploy mechanism
+
+Manual, documented — matching this project's style (manual `psql` for the
+allowlist, manual console for the un-self-grantable IAM policies). Add:
+
+- **`deploy/build_and_push.sh`** — `aws ecr get-login-password` → docker
+  build → tag → push to `rag-email-agent` ECR repo.
+- **`deploy/deploy.md`** — the one-time role/secret/function/schedule
+  creation commands, then the repeatable
+  `aws lambda update-function-code --image-uri ...` for subsequent
+  deploys.
+
+No Terraform / CDK — not in the project, not worth introducing for one
+function.
+
+#### Not doing (this entry)
+
+- **No `ingest` skip-already-embedded change** in this entry — recommended
+  as a companion PR (check `graph_message_id` before embedding, cuts most
+  of the run time) but it's a behavior change to a working command and
+  deserves its own small proposal.
+- **No CloudWatch alarm / SNS / SQS DLQ** — needs permissions outside the
+  deploy policy; the in-handler Graph email + Scheduler retry is the v1
+  guardrail. Revisit if the pipeline proves flaky in practice.
+- **No VPC, no RDS reconsideration, no multi-region.**
+- **No web-app (`app.py`) deployment** — out of scope; the Flask app stays
+  local-only for OAuth onboarding.
+
+#### Verification plan
+
+1. Compile-check; `get_openai_api_key()` returns the key locally; a full
+   local `ingest`/`triage`/`digest` run still works reading `OPENAI_API_KEY`
+   from Secrets Manager.
+2. Build the image, run it locally against the Lambda RIE
+   (`lambda_handler.handler` with a synthetic event) — confirm all three
+   phases execute and the DB shows the writes, before any push.
+3. Push to ECR; create the two roles, the secret, the function.
+4. `aws lambda invoke` once, manually — confirm a real end-to-end run
+   (both accounts, real digest emails, `digest_log` rows) purely inside
+   Lambda, no local involvement.
+5. Deliberately break one thing (e.g. a bad OpenAI key) and re-invoke —
+   confirm the failure email arrives and the invocation is recorded as an
+   error.
+6. Create the schedule; confirm one real scheduled fire the next morning
+   (or set a one-off near-term `at()` schedule to not wait a day).
+7. Re-invoke / re-fire after a successful run — confirm idempotency
+   (`already_sent` skip, no second email).
+
+**Explicit checkpoint — stop after step 7.** That completes Step 5.
+Post-launch monitoring/alarm hardening and the `ingest` optimization are
+separate follow-ups.
 
 ### 2026-08-17 — Step 5 deployment: AWS permissions gap + least-privilege policy proposal
 
